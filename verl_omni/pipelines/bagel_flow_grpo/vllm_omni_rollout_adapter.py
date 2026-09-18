@@ -34,6 +34,7 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from verl_omni.pipelines.bagel_flow_grpo.common import (
     BAGEL_FLOWGRPO_CFG_DEFAULTS,
+    BAGEL_TIMESTEP_SHIFT,
     maybe_to_cpu,
     setup_bagel_sigmas,
 )
@@ -247,11 +248,28 @@ class BagelPipelineWithLogProb(BagelPipeline):
     #: the modality from the adapter instead of inferring it from tensor rank.
     diffusion_io_spec = DiffusionIOSpec(primary=MediaSpec("image"))
 
+    #: Sigma-schedule shift, kept in sync with the shift the pipeline itself
+    #: applies.  BAGEL-lineage models that ship a different default (Lance
+    #: uses 3.5) override this instead of duplicating ``forward``.
+    flowgrpo_timestep_shift: float = BAGEL_TIMESTEP_SHIFT
+
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
         inner = FlowMatchSDEDiscreteScheduler()
         self.scheduler = _BagelSchedulerAdapter(inner)
         logger.info("BagelPipelineWithLogProb: SDE scheduler enabled for RL rollouts")
+
+    @classmethod
+    def flowgrpo_setup_sigmas(cls, scheduler: FlowMatchSDEDiscreteScheduler, num_steps: int, shift: float) -> None:
+        """Configure the scheduler for a rollout of ``num_steps`` denoise steps.
+
+        BAGEL samples ``num_steps`` schedule points and runs one fewer Euler
+        step.  A BAGEL-lineage model whose denoise loop walks a different grid
+        (Lance samples one point more) overrides this instead of duplicating
+        ``forward``, so the trainer and the rollout keep building the schedule
+        from the same place.
+        """
+        setup_bagel_sigmas(scheduler, num_steps, shift=shift)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         """Load weights, routing by name prefix.
@@ -346,9 +364,12 @@ class BagelPipelineWithLogProb(BagelPipeline):
         self.scheduler_kwargs["include_logprob_normalizer"] = False
 
         # Per-request scheduler setup matching training-side sigma schedule.
+        # Pin the pipeline's own shift to the same value so the sigmas the
+        # scheduler holds and the ones the pipeline steps through cannot drift.
         assert req.sampling_params.num_inference_steps is not None, "num_inference_steps must be set for RL rollouts"
         bagel_num_timesteps = int(req.sampling_params.num_inference_steps)
-        setup_bagel_sigmas(self.scheduler._inner, bagel_num_timesteps)
+        timestep_shift = float(extra_args.setdefault("timestep_shift", self.flowgrpo_timestep_shift))
+        self.flowgrpo_setup_sigmas(self.scheduler._inner, bagel_num_timesteps, timestep_shift)
 
         # Reset adapter state *after* set_timesteps so inner step_index is None.
         self.scheduler.begin_forward(
