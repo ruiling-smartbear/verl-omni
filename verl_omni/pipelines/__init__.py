@@ -16,6 +16,7 @@ from . import (
     bagel_flow_grpo,
     boogu_image_flow_grpo,
     flux_dance_grpo,
+    lance_flow_grpo,
     ltx2_flow_grpo,
     minimax_h3_diffusion_nft,
     minimax_h3_flow_grpo,
@@ -55,6 +56,7 @@ __all__ += list(qwen_image_flow_grpo.__all__)
 __all__ += list(qwen_image_diffusion_nft.__all__)
 __all__ += list(qwen_image_mix_grpo.__all__)
 __all__ += list(bagel_flow_grpo.__all__)
+__all__ += list(lance_flow_grpo.__all__)
 __all__ += list(ltx2_flow_grpo.__all__)
 __all__ += list(minimax_h3_diffusion_nft.__all__)
 __all__ += list(minimax_h3_flow_grpo.__all__)
