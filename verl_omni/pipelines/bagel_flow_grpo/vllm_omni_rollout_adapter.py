@@ -202,6 +202,37 @@ class _BagelSchedulerAdapter:
         return _AdapterStepOutput(prev_sample=prev_sample, log_prob=log_prob)
 
 
+def _slice_trajectory_to_window(
+    latents: Any,
+    timesteps: Any,
+    log_probs: Any,
+    sde_window: tuple[int, int],
+) -> tuple[Any, Any, Any]:
+    """Keep the ``[begin, end)`` steps of a time-major trajectory.
+
+    Latents keep one extra entry (the state after the last window step).
+    Log-probs need care: the scheduler adapter returns one only inside the
+    window and the pipeline drops the ``None`` entries, so the record is
+    normally already window-aligned and must not be sliced again; a record
+    covering the whole trajectory is sliced like the timesteps.
+    """
+    begin, end = sde_window
+    n_steps = len(timesteps) if timesteps is not None else None
+    if latents is not None:
+        latents = latents[begin : end + 1]
+    if timesteps is not None:
+        timesteps = timesteps[begin:end]
+    if log_probs is not None:
+        if n_steps is not None and len(log_probs) == n_steps:
+            log_probs = log_probs[begin:end]
+        elif len(log_probs) != end - begin:
+            raise ValueError(
+                f"expected {end - begin} in-window log-probs or {n_steps} for the whole "
+                f"trajectory, got {len(log_probs)}"
+            )
+    return latents, timesteps, log_probs
+
+
 def _pick_sde_window(
     window_size: Optional[int],
     window_range: Optional[Any],
@@ -385,13 +416,9 @@ class BagelPipelineWithLogProb(BagelPipeline):
         traj_latents, traj_timesteps, traj_log_probs = _extract_bagel_trajectory(output)
 
         if sde_window is not None:
-            begin, end = sde_window
-            if traj_latents is not None:
-                traj_latents = traj_latents[begin : end + 1]
-            if traj_timesteps is not None:
-                traj_timesteps = traj_timesteps[begin:end]
-            if traj_log_probs is not None:
-                traj_log_probs = traj_log_probs[begin:end]
+            traj_latents, traj_timesteps, traj_log_probs = _slice_trajectory_to_window(
+                traj_latents, traj_timesteps, traj_log_probs, sde_window
+            )
 
         # BAGEL trajectories are time-major; add a batch axis for training consumers.
         if traj_latents is not None:
