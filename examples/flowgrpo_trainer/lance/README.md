@@ -114,19 +114,23 @@ the trainer's log-prob of each transition should match the one the rollout's
 SDE sampler produced when it drew that transition.  `old_log_probs` is the
 trainer's own recompute, so `actor/ratio_mean` being 1.0 on the first update
 only says the update path is deterministic; it does not compare against the
-rollout.  For the comparison itself set
+rollout. The recipe enables the comparison with
 
     actor_rollout_ref.rollout.calculate_log_probs=True
 
 and read `rollout_corr/logprob_abs_diff_mean`, `rollout_corr/logprob_abs_diff_max`
 and the per-timestep `rollout_corr/logprob_abs_diff/ts_*` on the first step.
 Both sides run the same weights (LoRA is merged before the sync) and skip the
-Gaussian normalizer, so only bf16 noise should separate them.  Two things
-diverge from BAGEL and are the first places to look if the difference is
-large: the sigma schedule (Lance shifts by 3.5 and samples one more point
-than BAGEL) and the rotary positions (Lance gives the latents per-token
-`(h, w)` where BAGEL gives the block one scalar).  The per-timestep split
-says whether the error sits at one end of the grid or everywhere.
+Gaussian normalizer. Numerical differences can still come from precision
+and attention backends; do not assume a discrepancy is bf16 noise without
+checking the inputs and replay settings. Two differences from BAGEL are the
+sigma schedule (Lance shifts by 3.5 and samples one more point) and the
+rotary positions (Lance gives the latents per-token `(h, w)`). Each sample's
+image positions must start after its own valid text prefix, including in
+mixed-length batches. The CPU tests compare batched outputs and gradients
+against individual forwards, with and without gradient checkpointing. This
+does not replace a GPU rollout/trainer comparison with the released weights.
+The per-timestep split shows where discrepancies occur along the grid.
 
 A wider SDE window (for example `sde_window_size=15 sde_window_range='[0,15]'`
 at 15 steps) puts every timestep into the comparison.

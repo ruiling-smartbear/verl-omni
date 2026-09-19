@@ -483,7 +483,16 @@ class BagelForTraining(NonDiffusersModelBase):
         self.llm2vae = nn.Linear(config.hidden_size, config.patch_latent_dim)
         self.latent_pos_embed = PositionEmbedding(config.max_latent_size, config.hidden_size)
 
-    def build_position_ids(self, batch: int, num_text: int, num_latent: int, latent_pos_ids: Tensor, device) -> Tensor:
+    def build_position_ids(
+        self,
+        batch: int,
+        num_text: int,
+        num_latent: int,
+        latent_pos_ids: Tensor,
+        device,
+        *,
+        text_attention_mask: Optional[Tensor] = None,
+    ) -> Tensor:
         """RoPE positions for text + start marker + latents + end marker.
 
         BAGEL gives the whole image block a single position; the spatial
@@ -498,6 +507,7 @@ class BagelForTraining(NonDiffusersModelBase):
             num_latent: Number of latent tokens.
             latent_pos_ids: ``(L_latent,)`` or ``(B, L_latent)`` grid indices.
             device: Device for the returned tensor.
+            text_attention_mask: Optional valid-text mask for model-specific positions.
 
         Returns:
             ``(B, L_total)`` positions, or any shape the rotary accepts.
@@ -583,7 +593,9 @@ class BagelForTraining(NonDiffusersModelBase):
         latent_mask = ~text_mask
 
         # 6. RoPE positions
-        position_ids = self.build_position_ids(B, L_ctx, L_latent, latent_pos_ids, dev)
+        position_ids = self.build_position_ids(
+            B, L_ctx, L_latent, latent_pos_ids, dev, text_attention_mask=text_attention_mask
+        )
 
         # Key padding mask: zero-padded text tokens in uneven micro-batches
         # must not attend to image queries.  ``None`` keeps the flash backend.

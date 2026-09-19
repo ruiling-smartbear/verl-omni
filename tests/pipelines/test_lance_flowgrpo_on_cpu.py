@@ -15,11 +15,10 @@
 """CPU contracts for the Lance FlowGRPO integration.
 
 Lance reuses BAGEL's MoT transformer; what it does not share is the sigma
-shift, the Wan2.2 latent geometry and the checkpoint layout.  These tests pin
-exactly those, plus the assumption that lets the text-to-image path reuse
-BAGEL's 1-D RoPE: Lance's mRoPE is fed the same scalar position on all three
-``(t, h, w)`` axes for image tokens, which is numerically identical to 1-D
-RoPE.  Nothing here needs a GPU or the released checkpoint.
+shift, the Wan2.2 latent geometry and the checkpoint layout. These tests also
+check three-axis image positions and that right padding preserves each
+sample's output and gradients. Nothing here needs a GPU or the released
+checkpoint; rollout contract tests require vllm-omni.
 """
 
 import inspect
@@ -414,6 +413,74 @@ def test_from_pretrained_takes_shapes_from_the_checkpoint(tmp_path):
     model = LanceForTraining.from_pretrained(str(tmp_path), torch_dtype=torch.float32)
     assert model.config.vocab_size == TINY_LLM_CONFIG["vocab_size"]
     assert model.embed_tokens.weight.shape[0] == TINY_LLM_CONFIG["vocab_size"]
+
+
+@pytest.mark.parametrize("key", ["language_model.model.layers.0.self_attn.q_proj_moe_gen.weight", "vae2llm.weight"])
+def test_from_pretrained_rejects_missing_training_weights(tmp_path, key):
+    from safetensors.torch import load_file
+
+    ckpt_dir = _write_tiny_checkpoint(str(tmp_path))
+    path = os.path.join(ckpt_dir, "model.safetensors")
+    weights = load_file(path)
+    del weights[key]
+    save_file(weights, path)
+
+    with pytest.raises(RuntimeError, match="Missing key"):
+        LanceForTraining.from_pretrained(str(tmp_path), torch_dtype=torch.float32)
+
+
+@pytest.mark.parametrize("short_length", [0, 3, 7])
+@pytest.mark.parametrize("checkpointing", [False, True])
+@pytest.mark.parametrize("shared_grid", [False, True])
+def test_batched_forward_and_gradients_match_individual_samples(short_length, checkpointing, shared_grid):
+    """Padding and other samples' grids must not change a sample's policy."""
+    torch.manual_seed(222)
+    config = _tiny_config()
+    model = LanceForTraining(config).float()
+    if checkpointing:
+        model.enable_gradient_checkpointing()
+    latents = torch.randn(2, 4, config.patch_latent_dim)
+    timesteps = torch.tensor([0.6, 0.4])
+    # Same token count, different spatial coordinates for the second sample.
+    grids = torch.tensor([[0, 1, 8, 9], [0, 1, 2, 3]])
+    if shared_grid:
+        grids[1] = grids[0]
+    tokens = torch.randint(1, 190, (2, 7))
+    lengths = [short_length, 7]
+    mask = torch.arange(7).unsqueeze(0) < torch.tensor(lengths).unsqueeze(1)
+
+    individual = []
+    for row, length in enumerate(lengths):
+        output = model(
+            hidden_states=latents[row : row + 1],
+            timestep=timesteps[row : row + 1],
+            text_token_ids=tokens[row : row + 1, :length] if length else None,
+            latent_pos_ids=grids[row : row + 1],
+        )[0]
+        individual.append(output.detach())
+        output.square().sum().backward()
+    expected_grads = {name: p.grad.clone() if p.grad is not None else None for name, p in model.named_parameters()}
+    model.zero_grad(set_to_none=True)
+
+    batched = model(
+        hidden_states=latents,
+        timestep=timesteps,
+        text_token_ids=tokens,
+        text_attention_mask=mask,
+        latent_pos_ids=grids,
+    )[0]
+    torch.testing.assert_close(batched, torch.cat(individual), rtol=1e-5, atol=1e-6)
+    batched.square().sum().backward()
+    for name, parameter in model.named_parameters():
+        expected = expected_grads[name]
+        assert (parameter.grad is None) == (expected is None), name
+        if expected is not None:
+            # BAGEL casts attention to bf16 even for a float32 model. Masked
+            # and unmasked SDPA backward reductions can round differently.
+            # Bound relative gradient-norm error by one bf16 epsilon.
+            error = (parameter.grad - expected).norm()
+            tolerance = torch.finfo(torch.bfloat16).eps * expected.norm() + 1e-5
+            assert error <= tolerance, f"{name}: gradient error {error.item()} > {tolerance.item()}"
 
 
 def test_forward_returns_velocity_shaped_like_the_latent():
