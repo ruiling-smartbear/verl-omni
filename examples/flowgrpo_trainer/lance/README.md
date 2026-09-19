@@ -109,15 +109,27 @@ change.
 
 ### Checking rollout and trainer agree
 
-The FlowGRPO importance ratio is only unbiased when the log-probs the trainer
-recomputes match the ones the rollout recorded.  Nothing has moved yet on the
-first update of a step, so if the two agree `actor/ratio_mean` is 1.0 and
-`actor/ppo_kl` and `actor/pg_clipfrac` are about zero.  Read those on the
-first step: a schedule or CFG mismatch pushes the ratio off 1 and starts the
-clipping immediately, before any reward signal exists.  Two things diverge
-from BAGEL and are the first places to look: the sigma schedule (Lance shifts
-by 3.5 and samples one more point than BAGEL) and the rotary positions (Lance
-gives the latents per-token `(h, w)` where BAGEL gives the block one scalar).
+FlowGRPO replays the rollout's recorded transitions through the trainer, so
+the trainer's log-prob of each transition should match the one the rollout's
+SDE sampler produced when it drew that transition.  `old_log_probs` is the
+trainer's own recompute, so `actor/ratio_mean` being 1.0 on the first update
+only says the update path is deterministic; it does not compare against the
+rollout.  For the comparison itself set
+
+    actor_rollout_ref.rollout.calculate_log_probs=True
+
+and read `rollout_corr/logprob_abs_diff_mean`, `rollout_corr/logprob_abs_diff_max`
+and the per-timestep `rollout_corr/logprob_abs_diff/ts_*` on the first step.
+Both sides run the same weights (LoRA is merged before the sync) and skip the
+Gaussian normalizer, so only bf16 noise should separate them.  Two things
+diverge from BAGEL and are the first places to look if the difference is
+large: the sigma schedule (Lance shifts by 3.5 and samples one more point
+than BAGEL) and the rotary positions (Lance gives the latents per-token
+`(h, w)` where BAGEL gives the block one scalar).  The per-timestep split
+says whether the error sits at one end of the grid or everywhere.
+
+A wider SDE window (for example `sde_window_size=15 sde_window_range='[0,15]'`
+at 15 steps) puts every timestep into the comparison.
 
 ## Not covered here
 
