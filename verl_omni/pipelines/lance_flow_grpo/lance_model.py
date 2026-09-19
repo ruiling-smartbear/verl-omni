@@ -300,8 +300,8 @@ class LanceRotaryEmbedding(RotaryEmbedding):
 class LanceForTraining(BagelForTraining):
     """Lance MoT module for FlowGRPO FSDP training.
 
-    The architecture is BAGEL's; only the checkpoint and the latent geometry
-    differ, so this subclass overrides loading alone.
+    Reuses BAGEL's layers and parameter names with Lance's checkpoint layout,
+    latent geometry, and three-axis rotary positions.
     """
 
     def __init__(self, config: LanceTrainingConfig):
@@ -317,7 +317,16 @@ class LanceForTraining(BagelForTraining):
                 mrope_section=config.mrope_section,
             )
 
-    def build_position_ids(self, batch: int, num_text: int, num_latent: int, latent_pos_ids: Tensor, device) -> Tensor:
+    def build_position_ids(
+        self,
+        batch: int,
+        num_text: int,
+        num_latent: int,
+        latent_pos_ids: Tensor,
+        device,
+        *,
+        text_attention_mask: Tensor | None = None,
+    ) -> Tensor:
         """Per-token ``(t, h, w)`` positions, matching what the rollout feeds.
 
         ``LanceBagel.prepare_vae_latent`` replaces the scalar positions BAGEL
@@ -327,10 +336,8 @@ class LanceForTraining(BagelForTraining):
             latent (hi, wi) -> (P + 1,        P + 1 + hi,   P + 1 + wi)
             end_of_image    -> (P + max_hw + 1, same, same)
 
-        with ``P`` the rope counter after the text prefix.  Replaying on
-        BAGEL's single scalar instead would evaluate the policy under a
-        different rotary basis than the one that produced the trajectory, so
-        the importance ratio would not be 1 even before the first update.
+        with ``P`` the number of valid text tokens in each sample. Padding
+        occupies sequence slots but must not advance the image's positions.
 
         The grid coordinates come from ``latent_pos_ids``, which
         ``get_flattened_position_ids`` builds as ``hi * max_latent_size + wi``.
@@ -341,30 +348,35 @@ class LanceForTraining(BagelForTraining):
             num_latent: Number of latent tokens.
             latent_pos_ids: ``(L_latent,)`` or ``(B, L_latent)`` grid indices.
             device: Device for the returned tensor.
+            text_attention_mask: ``(B, num_text)`` mask for right-padded text.
 
         Returns:
             ``(B, 3, L_total)`` long tensor, rows ordered ``(t, h, w)``.
         """
-        grid = latent_pos_ids.to(device).reshape(batch, -1)[0] if latent_pos_ids.ndim > 1 else latent_pos_ids.to(device)
-        if grid.numel() != num_latent:
-            raise ValueError(f"latent_pos_ids has {grid.numel()} entries for {num_latent} latent tokens")
+        grid = latent_pos_ids.to(device=device, dtype=torch.long)
+        if grid.ndim == 1:
+            grid = grid.unsqueeze(0).expand(batch, -1)
+        if grid.shape != (batch, num_latent):
+            raise ValueError(f"latent_pos_ids has shape {tuple(grid.shape)}, expected {(batch, num_latent)}")
         side = int(self.config.max_latent_size)
         rows = torch.div(grid, side, rounding_mode="floor")
         cols = grid % side
-        anchor = int(num_text)  # P: the position the text prefix ends on
-        max_hw = int(torch.maximum(rows.max(), cols.max()).item()) + 1
+        if text_attention_mask is None:
+            anchor = grid.new_full((batch, 1), num_text)
+        else:
+            anchor = text_attention_mask.to(device=device, dtype=torch.bool).sum(dim=-1, keepdim=True)
+        max_hw = torch.maximum(rows.amax(dim=-1, keepdim=True), cols.amax(dim=-1, keepdim=True)) + 1
 
-        text = torch.arange(num_text, device=device, dtype=torch.long)
-        start = torch.full((1,), anchor, device=device, dtype=torch.long)
-        end = torch.full((1,), anchor + max_hw + 1, device=device, dtype=torch.long)
-        latent_t = torch.full((num_latent,), anchor + 1, device=device, dtype=torch.long)
+        text = torch.arange(num_text, device=device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
+        end = anchor + max_hw + 1
+        latent_t = (anchor + 1).expand(-1, num_latent)
 
         axes = [
-            torch.cat([text, start, latent_t, end]),
-            torch.cat([text, start, anchor + 1 + rows.long(), end]),
-            torch.cat([text, start, anchor + 1 + cols.long(), end]),
+            torch.cat([text, anchor, latent_t, end], dim=-1),
+            torch.cat([text, anchor, anchor + 1 + rows, end], dim=-1),
+            torch.cat([text, anchor, anchor + 1 + cols, end], dim=-1),
         ]
-        return torch.stack(axes).unsqueeze(0).expand(batch, -1, -1)
+        return torch.stack(axes, dim=1)
 
     @classmethod
     def from_pretrained(cls, model_path: str, torch_dtype=torch.bfloat16) -> LanceForTraining:
@@ -408,11 +420,5 @@ class LanceForTraining(BagelForTraining):
                 config.max_latent_size = grid
 
         model = cls(config)
-        missing, unexpected = model.load_state_dict(mapped, strict=False)
-        if missing:
-            logger.warning("Missing keys when loading LanceForTraining: %d (first: %s)", len(missing), missing[:5])
-        if unexpected:
-            logger.warning(
-                "Unexpected keys when loading LanceForTraining: %d (first: %s)", len(unexpected), unexpected[:5]
-            )
+        model.load_state_dict(mapped, strict=True)
         return model.to(torch_dtype)
