@@ -38,9 +38,11 @@ from verl_omni.pipelines.bagel_flow_grpo.common import (
 )
 from verl_omni.pipelines.lance_flow_grpo.common import (
     LANCE_MROPE_SECTION,
+    LANCE_TEMPORAL_ROPE_SCALE,
     LANCE_TIMESTEP_SHIFT,
     setup_lance_sigmas,
 )
+from verl_omni.pipelines.lance_flow_grpo.diffusers_training_adapter import LanceDiffusion
 from verl_omni.pipelines.lance_flow_grpo.lance_model import (
     LanceForTraining,
     LanceRotaryEmbedding,
@@ -258,6 +260,68 @@ def test_trainer_positions_are_not_bagels_scalar():
     assert block[1].unique().numel() > 1, "the h axis must vary across rows"
     assert block[2].unique().numel() > 1, "the w axis must vary across columns"
     assert not torch.equal(block[1], block[2]), "h and w must not collapse onto each other"
+
+
+#: 25 pixel frames at the 4x temporal stride: 7 latent frames.
+_VIDEO_FRAMES = 25
+_VIDEO_LATENT_FRAMES = (_VIDEO_FRAMES - 1) // 4 + 1
+
+
+def _rollout_video_block_positions(video_shape: tuple[int, int, int], anchor: int) -> torch.Tensor:
+    """The 3-D positions ``LanceBagel`` feeds for a video generation block.
+
+    Calls the rollout's own builder, like the image helper above, so the trainer
+    cannot drift from the rotary basis the trajectory was produced under.
+    """
+    from vllm_omni.diffusion.models.lance.lance_transformer import LanceBagel
+
+    stub = SimpleNamespace(
+        latent_downsample=_LATENT_DOWNSAMPLE,
+        config=SimpleNamespace(vae_config=SimpleNamespace(downsample_temporal=4)),
+    )
+    return LanceBagel._per_token_mrope_for_video_latent(stub, [video_shape], [anchor])
+
+
+def test_trainer_video_positions_are_the_ones_the_rollout_feeds():
+    """Video adds a temporal axis, amplified the way the rollout amplifies it.
+
+    ``build_position_ids`` has to place ``(P + 1 + t * t_scale, P + 1 + h, P + 1 + w)``
+    for the latent block so the trainer replays on the rollout's rotary basis.
+    """
+    num_text = 7
+    config = _tiny_config()
+    config.max_latent_size = 64  # the released grid, so the ids match the rollout
+    model = LanceForTraining(config)
+    latent_pos_ids = get_flattened_position_ids(
+        _IMAGE_HW, _IMAGE_HW, _LATENT_DOWNSAMPLE, 64, num_frames=_VIDEO_LATENT_FRAMES
+    )
+    assert latent_pos_ids.numel() == _VIDEO_LATENT_FRAMES * 32 * 32
+
+    positions = model.build_position_ids(1, num_text, latent_pos_ids.numel(), latent_pos_ids, torch.device("cpu"))
+    expected = _rollout_video_block_positions((_VIDEO_FRAMES, _IMAGE_HW, _IMAGE_HW), num_text)
+    assert torch.equal(positions[0, :, num_text:], expected)
+
+    # The temporal axis must actually be present, and carry the amplification.
+    # The block is the start marker, the latent tokens and the end marker.
+    latent = positions[0, :, num_text + 1 : -1]
+    assert latent[0].unique().numel() == _VIDEO_LATENT_FRAMES
+    assert int(latent[0].max()) - int(latent[0].min()) == (_VIDEO_LATENT_FRAMES - 1) * LANCE_TEMPORAL_ROPE_SCALE
+
+
+def test_lance_adapter_asks_for_a_temporal_axis_only_on_video():
+    """The adapter derives the grid; one frame must stay BAGEL's image grid."""
+    config = _tiny_config()
+    config.max_latent_size = 64
+    module = SimpleNamespace(config=config)
+    model_config = SimpleNamespace(pipeline=SimpleNamespace(height=_IMAGE_HW, width=_IMAGE_HW, num_frames=1))
+
+    image_ids = LanceDiffusion._get_latent_pos_ids(model_config, module, "cpu")
+    assert torch.equal(image_ids, get_flattened_position_ids(_IMAGE_HW, _IMAGE_HW, _LATENT_DOWNSAMPLE, 64))
+
+    model_config.pipeline.num_frames = _VIDEO_FRAMES
+    video_ids = LanceDiffusion._get_latent_pos_ids(model_config, module, "cpu")
+    assert video_ids.numel() == _VIDEO_LATENT_FRAMES * 32 * 32
+    assert int(video_ids.max()) == (_VIDEO_LATENT_FRAMES - 1) * 64 * 64 + 31 * 64 + 31
 
 
 def test_trainer_rotary_is_the_rollouts_rotary():
