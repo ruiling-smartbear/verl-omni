@@ -37,13 +37,30 @@ class LanceDiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
     """Extract reference media without a processor, as LTX-2.3's loop does."""
 
     async def process_multi_modal_info(self, messages: list[dict]) -> dict[str, Any]:
-        """Extract reference media independently of the text encoder's processor."""
+        """Collect reference media from the message content itself.
+
+        Nothing else can: Lance ships no processor, so the dataset layer's
+        content items are the only place the reference lives, and it has already
+        turned the ``<image>`` marker into an image item by the time this runs.
+        """
         if self.processor is not None:
             return await super().process_multi_modal_info(messages)
-        media = await self.dataset_cls.process_multi_modal_info(messages, image_patch_size=14, config=self.data_config)
-        return {
-            key: value for key, value in zip(("images", "videos", "audios"), media, strict=True) if value is not None
-        }
+        media: dict[str, list[Any]] = {"images": [], "videos": [], "audios": []}
+        for message in messages:
+            content = message.get("content")
+            if not isinstance(content, list):
+                continue
+            for item in content:
+                if not isinstance(item, dict):
+                    continue
+                kind = item.get("type")
+                if kind == "image":
+                    media["images"].append(item["image"])
+                elif kind == "video":
+                    media["videos"].append(item["video"])
+                elif kind == "audio":
+                    media["audios"].append(item["audio"])
+        return {key: values for key, values in media.items() if values}
 
     def _assert_mm_supported(self, has_multi_modal: bool) -> None:
         """Allow reference media carried beside the prompt."""
