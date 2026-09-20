@@ -17,6 +17,7 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
+import numpy as np
 import pytest
 import torch
 import yaml
@@ -900,6 +901,59 @@ def test_diffusion_strategy_omits_audio_sample_rate_without_declared_spec(monkey
     assert "audio_sample_rate" not in processed.extra_fields
     # No declared spec => no declared media kind is surfaced either.
     assert "media_kind" not in processed.extra_fields
+
+
+def test_diffusion_strategy_keeps_the_frame_axis_of_a_decoded_video(monkeypatch):
+    """A frame-per-entry video payload must not collapse into one image.
+
+    vllm-omni puts a video pipeline's decoded frames straight into
+    ``OmniRequestOutput.images`` - Lance's t2v returns one PIL frame per entry -
+    so the whole payload is this sample.  Reading ``images[0]`` alone turns a
+    25-frame video into a single image, which the video rewards then reject.
+    """
+    from PIL import Image
+    from torchvision.transforms import PILToTensor
+
+    strategy = DiffusionStrategy(SimpleNamespace(global_steps=1, _to_tensor=PILToTensor()))
+    monkeypatch.setattr(strategy, "_diffusion_io_spec", lambda: DiffusionIOSpec(MediaSpec("video")))
+    frames = [Image.fromarray(np.full((4, 6, 3), fill, dtype=np.uint8)) for fill in (10, 120, 250)]
+    final_res = SimpleNamespace(
+        images=frames,
+        trajectory_latents=None,
+        trajectory_timesteps=None,
+        trajectory_log_probs=None,
+        multimodal_output=None,
+        request_output=None,
+    )
+
+    processed = strategy.process_output(final_res, None, {"output_type": "pt"})
+
+    assert processed.diffusion_output.shape == (3, 3, 4, 6)
+    assert processed.diffusion_output.dtype == torch.uint8
+    assert [int(frame[0, 0, 0]) for frame in processed.diffusion_output] == [10, 120, 250]
+    assert processed.extra_fields["media_kind"] == "video"
+
+
+def test_diffusion_strategy_reads_a_single_frame_image_payload(monkeypatch):
+    """One declared image per request still takes ``images[0]`` as the sample."""
+    from PIL import Image
+    from torchvision.transforms import PILToTensor
+
+    strategy = DiffusionStrategy(SimpleNamespace(global_steps=1, _to_tensor=PILToTensor()))
+    monkeypatch.setattr(strategy, "_diffusion_io_spec", lambda: DiffusionIOSpec(MediaSpec("image")))
+    final_res = SimpleNamespace(
+        images=[Image.fromarray(np.full((4, 6, 3), 7, dtype=np.uint8))],
+        trajectory_latents=None,
+        trajectory_timesteps=None,
+        trajectory_log_probs=None,
+        multimodal_output=None,
+        request_output=None,
+    )
+
+    processed = strategy.process_output(final_res, None, {"output_type": "pt"})
+
+    assert processed.diffusion_output.shape == (3, 4, 6)
+    assert processed.extra_fields["media_kind"] == "image"
 
 
 @pytest.mark.parametrize(

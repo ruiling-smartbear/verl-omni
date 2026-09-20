@@ -13,7 +13,7 @@
 # limitations under the License.
 import logging
 from argparse import Namespace
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping, Sequence
 from dataclasses import asdict
 from typing import Any, Optional
 
@@ -54,6 +54,41 @@ def _pixel_output_to_uint8(output: torch.Tensor) -> torch.Tensor:
         raise ValueError("Pixel rollout output must contain only finite values")
     output = output.clamp_(0, 1)
     return output.mul_(255).round_().to(dtype=torch.uint8)
+
+
+def _is_decoded_frame(value: Any) -> bool:
+    """Whether ``value`` is one decoded frame rather than a whole video payload.
+
+    True for a PIL image, a numpy frame or a ``[C, H, W]`` tensor; false for a
+    ``[T, C, H, W]`` tensor, a dict payload or the ``(video, audio)`` envelope
+    that pipelines with a joint audio stream return.
+    """
+    if isinstance(value, dict | tuple | list):
+        return False
+    if isinstance(value, torch.Tensor | np.ndarray):
+        return value.ndim == 3
+    return hasattr(value, "mode")  # PIL.Image, without importing PIL here.
+
+
+def _decoded_video_to_tensor(images: Sequence[Any], to_tensor: Callable[[Any], torch.Tensor]) -> torch.Tensor:
+    """A video pipeline's decoded frames as one ``[T, C, H, W]`` tensor.
+
+    vllm-omni puts the pipeline's frame list straight into
+    ``OmniRequestOutput.images``, so each entry is a single frame: PIL frames go
+    through the server's image transform, numpy and tensor frames are already
+    pixel tensors.  The rollout contract stores a video with its frame axis
+    (``[bsz, T, C, H, W]``), so the frames have to leave here stacked.
+    """
+    frames = []
+    for frame in images:
+        if isinstance(frame, torch.Tensor):
+            frames.append(frame)
+        elif isinstance(frame, np.ndarray):
+            array = torch.from_numpy(frame)
+            frames.append(array.permute(2, 0, 1) if array.ndim == 3 else array)
+        else:
+            frames.append(to_tensor(frame))
+    return torch.stack(frames)
 
 
 def _rollout_metadata_groups(multimodal_output: Any) -> tuple[Mapping[str, Any], ...]:
@@ -250,7 +285,12 @@ class DiffusionStrategy(OmniStrategyBase):
         )
         if pipeline_cls is None:
             return None
-        return pipeline_cls.flowgrpo_io_spec(model_config)
+        # A pipeline that does not derive from VllmOmniPipelineBase still only
+        # carries the class-level declaration.
+        resolve = getattr(pipeline_cls, "flowgrpo_io_spec", None)
+        if resolve is None:
+            return getattr(pipeline_cls, "diffusion_io_spec", None)
+        return resolve(model_config)
 
     def process_output(self, final_res: Any, params: Any, sampling_params: dict[str, Any]) -> DiffusionOutput:
         output_type = _diffusion_output_type(sampling_params)
@@ -277,13 +317,18 @@ class DiffusionStrategy(OmniStrategyBase):
                 extra_fields={"global_steps": self.server.global_steps},
             )
 
+        io_spec = self._diffusion_io_spec()
         diffusion_output = final_res.images[0]
         if isinstance(diffusion_output, dict):
             for key in ("video", "image", "output", "audio"):
                 if key in diffusion_output and diffusion_output[key] is not None:
                     diffusion_output = diffusion_output[key]
                     break
-        io_spec = self._diffusion_io_spec()
+        elif io_spec is not None and io_spec.primary.modality == "video" and _is_decoded_frame(diffusion_output):
+            # A video pipeline with no auxiliary stream hands back the decoded
+            # frames one per entry, so the whole payload is this sample instead
+            # of one image per entry; add back the frame axis.
+            diffusion_output = _decoded_video_to_tensor(final_res.images, self.server._to_tensor)
         req_output = getattr(final_res, "request_output", None) or final_res
         request_id = getattr(req_output, "request_id", getattr(final_res, "request_id", "unknown"))
         model_config = getattr(self.server, "model_config", None)
