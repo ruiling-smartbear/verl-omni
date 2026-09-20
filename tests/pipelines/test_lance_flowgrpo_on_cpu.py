@@ -598,7 +598,10 @@ def test_batched_forward_and_gradients_match_individual_samples(short_length, ch
         text_attention_mask=mask,
         latent_pos_ids=grids,
     )[0]
-    torch.testing.assert_close(batched, torch.cat(individual), rtol=1e-5, atol=1e-6)
+    expected_all = torch.cat(individual)
+    error = (batched - expected_all).norm()
+    tolerance = torch.finfo(torch.bfloat16).eps * expected_all.norm()
+    assert error <= tolerance, f"forward error {error.item()} > {tolerance.item()}"
     batched.square().sum().backward()
     for name, parameter in model.named_parameters():
         expected = expected_grads[name]
@@ -610,6 +613,30 @@ def test_batched_forward_and_gradients_match_individual_samples(short_length, ch
             error = (parameter.grad - expected).norm()
             tolerance = torch.finfo(torch.bfloat16).eps * expected.norm() + 1e-5
             assert error <= tolerance, f"{name}: gradient error {error.item()} > {tolerance.item()}"
+
+    # The padded-batch paths above are compared under a bf16 bound because the
+    # single-sample and batched calls reach different SDPA kernels.  The two
+    # claims the padding has to satisfy exactly are checked without any bound:
+    # a sample's text masked rather than truncated, and a different neighbour.
+    alone_masked = model(
+        hidden_states=latents[:1],
+        timestep=timesteps[:1],
+        text_token_ids=tokens[:1],
+        text_attention_mask=mask[:1],
+        latent_pos_ids=grids[:1],
+    )[0]
+    assert torch.equal(alone_masked, individual[0]), "masking padding must equal truncating it"
+
+    neighbour_tokens = (tokens[1:2] + 1) % (config.vocab_size - 1) + 1
+    neighbour_grids = torch.tensor([[0, 1, 4, 5]])
+    swapped = model(
+        hidden_states=latents,
+        timestep=timesteps,
+        text_token_ids=torch.cat([tokens[:1], neighbour_tokens]),
+        text_attention_mask=mask,
+        latent_pos_ids=torch.cat([grids[:1], neighbour_grids]),
+    )[0]
+    assert torch.equal(swapped[:1], batched[:1]), "another sample must not change this one"
 
 
 def test_forward_returns_velocity_shaped_like_the_latent():
