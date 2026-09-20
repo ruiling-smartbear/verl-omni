@@ -414,22 +414,7 @@ class DiffusionStrategy(OmniStrategyBase):
             extra_fields["all_latents"] = _maybe_unbatch(final_res.trajectory_latents)
         if final_res.trajectory_timesteps is not None:
             extra_fields["all_timesteps"] = _maybe_unbatch(final_res.trajectory_timesteps)
-        import sys as _sys
-
-        _mm = getattr(final_res, "multimodal_output", None)
-        _groups = _rollout_metadata_groups(_mm)
-        print(
-            "LANCEDBG strategy mm_type=%s mm_keys=%s meta_keys=%s rl_groups=%s"
-            % (
-                type(_mm).__name__,
-                sorted(_mm) if isinstance(_mm, Mapping) else None,
-                sorted(_mm.get("metadata") or {}) if isinstance(_mm, Mapping) else None,
-                len(_groups),
-            ),
-            file=_sys.stderr,
-            flush=True,
-        )
-        for metadata_group in _groups:
+        for metadata_group in _rollout_metadata_groups(final_res.multimodal_output):
             for key, value in metadata_group.items():
                 if key in extra_fields:
                     raise ValueError(f"Duplicate rollout metadata field: {key}")
