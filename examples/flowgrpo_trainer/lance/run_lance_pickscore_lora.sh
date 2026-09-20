@@ -1,6 +1,4 @@
 # Lance LoRA RL (text-to-image), vllm_omni rollout (FlowGRPO) with PickScore reward
-# For a two-step check, use run_lance_pickscore_smoke.sh: this full recipe
-# generates 48 * 16 images per step and validates at the final step.
 #
 # Lance shares BAGEL's transformer, so this mirrors the BAGEL PickScore
 # recipe.  What differs is the checkpoint (3B), the deploy config and the

@@ -98,35 +98,6 @@ Keep the template's literal newlines: a literal backslash followed by `n`
 becomes prompt text and also turns the blank negative prompt into a nonempty
 condition.
 
-### Run a two-step smoke check
-
-With the same dataset and checkpoints prepared above, run from the repository root:
-
-```bash
-bash examples/flowgrpo_trainer/lance/run_lance_pickscore_smoke.sh
-```
-
-This uses 4 GPUs, 4 prompts per step and 2 images per prompt: 16 training
-images across two steps. It keeps the full recipe's 512x512 resolution,
-15 denoising steps, SDE window, LoRA settings and rollout log-prob comparison.
-Like the BAGEL end-to-end test, it uses small microbatches and disables
-validation, checkpoint saving and automatic resume. Unlike that test, it uses
-the real Lance and PickScore weights. Overrides can be appended as usual.
-
-Setting only `trainer.total_training_steps=2` on the full recipe is expensive:
-each step still generates `48 * 16 = 768` images. A positive `test_freq` also
-triggers validation on the final step, even when that step is below the
-configured frequency. By default that evaluates the entire validation set;
-`log_val_generations` only limits logged images. A positive `save_freq`
-similarly saves a checkpoint on the final step.
-
-The progress bar advances after an entire training iteration. Generation and
-streaming PickScore evaluation both happen before that update, so `0/2` alone
-does not locate a stall. After completion, inspect `timing_s/gen`,
-`timing_s/update_actor` and the `rollout_corr/logprob_abs_diff_*` metrics.
-Completing this check verifies the small training path, not image quality,
-full-batch throughput or checkpoint recovery.
-
 ### Run LoRA training
 
 ```bash
