@@ -30,9 +30,8 @@ from __future__ import annotations
 import logging
 from types import SimpleNamespace
 
-from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.lance.pipeline_lance import LancePipeline
-from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from verl_omni.pipelines.bagel_flow_grpo.vllm_omni_rollout_adapter import BagelPipelineWithLogProb
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
@@ -96,8 +95,9 @@ class LancePipelineWithLogProb(BagelPipelineWithLogProb, LancePipeline):
         super().__init__(od_config=od_config, prefix=prefix)
         logger.info("LancePipelineWithLogProb: SDE scheduler enabled, timestep_shift=%s", LANCE_TIMESTEP_SHIFT)
 
-    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
-        """Hand a video run's reference frame over under the name the node reads.
+    @classmethod
+    def flowgrpo_media_keys(cls, model_config: DiffusionModelConfig) -> dict[str, str]:
+        """Name a video run's reference frame the way the i2v node reads it.
 
         The rollout transport only knows media modalities, so a conditioning
         frame arrives as ``multi_modal_data["image"]``.  On a video checkpoint
@@ -107,21 +107,8 @@ class LancePipelineWithLogProb(BagelPipelineWithLogProb, LancePipeline):
         dropped without an error.  The image checkpoint keeps the plain key,
         which is what ``_forward_image_edit`` reads.
         """
-        self._rename_condition_frame(req)
-        return super().forward(req)
-
-    def _rename_condition_frame(self, req: OmniDiffusionRequest) -> None:
-        """Move ``multi_modal_data["image"]`` to ``first_frame`` on a video run."""
-        if not LancePipeline._select_video_variant(self.od_config):
-            return
-        if not req.prompts or not isinstance(req.prompts[0], dict):
-            return
-        multi_modal_data = req.prompts[0].get("multi_modal_data")
-        if not isinstance(multi_modal_data, dict) or "image" not in multi_modal_data:
-            return
-        if multi_modal_data.get("first_frame") is not None:
-            raise ValueError(
-                "A video rollout request carries both multi_modal_data['image'] and ['first_frame']; "
-                "pass the reference frame through one of them."
-            )
-        multi_modal_data["first_frame"] = multi_modal_data.pop("image")
+        model = getattr(model_config, "local_path", None) or getattr(model_config, "path", "") or ""
+        od_config = SimpleNamespace(model=model, extra=getattr(model_config, "extra", None))
+        if LancePipeline._select_video_variant(od_config):
+            return {"image": "first_frame"}
+        return {}
