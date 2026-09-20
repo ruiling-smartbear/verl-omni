@@ -85,6 +85,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.rollout.calculate_log_probs=True \
     actor_rollout_ref.rollout.tensor_model_parallel_size=$ROLLOUT_TP \
     actor_rollout_ref.rollout.name=$ENGINE \
+    actor_rollout_ref.rollout.agent.default_agent_loop=lance_diffusion_single_turn_agent \
     actor_rollout_ref.rollout.n=16 \
     actor_rollout_ref.rollout.agent.num_workers=$((NUM_GPUS_ACTOR_ROLLOUT_REWARD / ROLLOUT_TP)) \
     actor_rollout_ref.rollout.load_format=safetensors \
