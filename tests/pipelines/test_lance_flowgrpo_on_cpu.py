@@ -423,6 +423,77 @@ def test_lance_video_routing_picks_i2v_only_for_a_first_frame():
     assert node(["video"], {"image": frame}) == "t2v"
 
 
+def _synthetic_edit_condition(
+    batch: int = 1, prefix: int = 3, ref: int = 5, tail: int = 4, latent: int = 4, hidden: int = 64
+):
+    """A condition bundle shaped like the rollout's image-edit export."""
+    return {
+        "condition_prefix_ids": torch.randint(1, 190, (batch, prefix)),
+        "condition_prefix_positions": torch.arange(prefix).expand(batch, -1),
+        "condition_ref_rows": torch.randn(batch, ref, hidden),
+        "condition_ref_positions": torch.arange(prefix, prefix + ref).expand(batch, -1),
+        "condition_ref_is_gen": torch.cat(
+            [torch.zeros(batch, ref - 2, dtype=torch.bool), torch.ones(batch, 2, dtype=torch.bool)], dim=1
+        ),
+        "condition_tail_ids": torch.randint(1, 190, (batch, tail)),
+        "condition_tail_positions": torch.arange(prefix + ref, prefix + ref + tail).expand(batch, -1),
+        "condition_tail_mask": torch.ones(batch, tail, dtype=torch.bool),
+        "condition_latent_positions": torch.zeros(batch, 3, latent + 2, dtype=torch.long),
+        "condition_latent_grid": torch.arange(latent).expand(batch, -1),
+    }
+
+
+def test_lance_replays_an_edit_condition_from_the_rollout():
+    """Exported reference rows, their routing and the latent basis all matter.
+
+    ``_forward_image_edit`` prefills the reference through the ViT and the VAE,
+    which this model cannot do; the rows and the positions they sat at travel
+    with the trajectory, and the replay has to use them rather than rebuild a
+    context of its own.
+    """
+    config = _tiny_config()
+    config.max_latent_size = 8
+    model = LanceForTraining(config).float()
+    latent = torch.randn(1, 4, config.patch_latent_dim)
+    timestep = torch.tensor([0.6])
+    condition = _synthetic_edit_condition()
+
+    (velocity,) = model(hidden_states=latent, timestep=timestep, condition=condition)
+    assert velocity.shape == (1, 4, config.patch_latent_dim)
+    assert torch.isfinite(velocity).all()
+
+    # The reference rows are part of the context, not decoration.
+    perturbed = {**condition, "condition_ref_rows": condition["condition_ref_rows"] + 1.0}
+    (other,) = model(hidden_states=latent, timestep=timestep, condition=perturbed)
+    assert not torch.allclose(velocity, other)
+
+    # The latent block's rotary basis is the rollout's, used verbatim.
+    shifted = {**condition, "condition_latent_positions": condition["condition_latent_positions"] + 5}
+    (moved,) = model(hidden_states=latent, timestep=timestep, condition=shifted)
+    assert not torch.allclose(velocity, moved)
+
+
+def test_lance_edit_condition_ignores_padded_tail_slots():
+    """Padding only keeps the batch rectangular, so it must not be attended to."""
+    config = _tiny_config()
+    config.max_latent_size = 8
+    model = LanceForTraining(config).float()
+    latent = torch.randn(1, 4, config.patch_latent_dim)
+    timestep = torch.tensor([0.6])
+    condition = _synthetic_edit_condition()
+    condition["condition_tail_mask"] = torch.tensor([[True, True, False, False]])
+    condition["condition_tail_positions"] = condition["condition_tail_positions"].clone()
+    condition["condition_tail_positions"][0, 2:] = 0
+
+    (velocity,) = model(hidden_states=latent, timestep=timestep, condition=condition)
+
+    noisy = {**condition, "condition_tail_ids": condition["condition_tail_ids"].clone()}
+    noisy["condition_tail_ids"][0, 2:] = 190  # outside the real instruction
+    (other,) = model(hidden_states=latent, timestep=timestep, condition=noisy)
+
+    assert torch.allclose(velocity, other), "masked tail slots changed the prediction"
+
+
 def test_lance_positions_honor_the_rollouts_anchor():
     """The latent block sits where the rollout put it, not after the text.
 
