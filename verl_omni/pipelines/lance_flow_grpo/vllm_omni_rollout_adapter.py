@@ -30,8 +30,9 @@ from __future__ import annotations
 import logging
 from types import SimpleNamespace
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig
+from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.lance.pipeline_lance import LancePipeline
+from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from verl_omni.pipelines.bagel_flow_grpo.vllm_omni_rollout_adapter import BagelPipelineWithLogProb
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
@@ -94,3 +95,33 @@ class LancePipelineWithLogProb(BagelPipelineWithLogProb, LancePipeline):
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
         logger.info("LancePipelineWithLogProb: SDE scheduler enabled, timestep_shift=%s", LANCE_TIMESTEP_SHIFT)
+
+    def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
+        """Hand a video run's reference frame over under the name the node reads.
+
+        The rollout transport only knows media modalities, so a conditioning
+        frame arrives as ``multi_modal_data["image"]``.  On a video checkpoint
+        that frame is a first frame, and ``LancePipeline.forward`` routes to
+        ``_forward_i2v`` only when it arrives as ``first_frame``: under the plain
+        key the request falls through to ``_forward_t2v`` and the reference is
+        dropped without an error.  The image checkpoint keeps the plain key,
+        which is what ``_forward_image_edit`` reads.
+        """
+        self._rename_condition_frame(req)
+        return super().forward(req)
+
+    def _rename_condition_frame(self, req: OmniDiffusionRequest) -> None:
+        """Move ``multi_modal_data["image"]`` to ``first_frame`` on a video run."""
+        if not LancePipeline._select_video_variant(self.od_config):
+            return
+        if not req.prompts or not isinstance(req.prompts[0], dict):
+            return
+        multi_modal_data = req.prompts[0].get("multi_modal_data")
+        if not isinstance(multi_modal_data, dict) or "image" not in multi_modal_data:
+            return
+        if multi_modal_data.get("first_frame") is not None:
+            raise ValueError(
+                "A video rollout request carries both multi_modal_data['image'] and ['first_frame']; "
+                "pass the reference frame through one of them."
+            )
+        multi_modal_data["first_frame"] = multi_modal_data.pop("image")

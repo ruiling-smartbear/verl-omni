@@ -360,6 +360,51 @@ def test_lance_rollout_declares_video_for_the_video_checkpoint_only():
     assert LancePipelineWithLogProb.flowgrpo_io_spec(unresolved).primary.modality == "video"
 
 
+def _lance_adapter_for(model: str):
+    """An adapter instance that only needs ``od_config`` for the rename."""
+    from verl_omni.pipelines.lance_flow_grpo.vllm_omni_rollout_adapter import LancePipelineWithLogProb
+
+    adapter = object.__new__(LancePipelineWithLogProb)
+    adapter.od_config = SimpleNamespace(model=model)
+    return adapter
+
+
+def test_lance_video_request_hands_the_reference_frame_to_i2v():
+    """A video run's reference frame has to arrive as ``first_frame``.
+
+    ``LancePipeline.forward`` sends a video request with ``first_frame`` to
+    ``_forward_i2v`` and one with no conditioning at all to ``_forward_t2v``, so
+    a frame left under the transport's plain ``image`` key would be dropped and
+    the run would silently train text-to-video instead.
+    """
+    bundle = "/models/bytedance-research/Lance"
+    frame = object()
+
+    video_adapter = _lance_adapter_for(f"{bundle}/Lance_3B_Video")
+    video_prompt = {"multi_modal_data": {"image": frame}}
+    video_adapter._rename_condition_frame(SimpleNamespace(prompts=[video_prompt]))
+    assert video_prompt["multi_modal_data"] == {"first_frame": frame}
+
+    # Text-to-video has no frame to move, and a video request keeps its video.
+    untouched = {"multi_modal_data": {"video": "clip.mp4"}}
+    video_adapter._rename_condition_frame(SimpleNamespace(prompts=[untouched]))
+    assert untouched["multi_modal_data"] == {"video": "clip.mp4"}
+    empty = {"modalities": ["video"]}
+    video_adapter._rename_condition_frame(SimpleNamespace(prompts=[empty]))
+    assert empty == {"modalities": ["video"]}
+
+    # The image checkpoint edits from the plain key, so it must not be renamed.
+    image_adapter = _lance_adapter_for(f"{bundle}/Lance_3B")
+    image_prompt = {"multi_modal_data": {"image": frame}}
+    image_adapter._rename_condition_frame(SimpleNamespace(prompts=[image_prompt]))
+    assert image_prompt["multi_modal_data"] == {"image": frame}
+
+    with pytest.raises(ValueError, match="both multi_modal_data"):
+        video_adapter._rename_condition_frame(
+            SimpleNamespace(prompts=[{"multi_modal_data": {"image": frame, "first_frame": object()}}])
+        )
+
+
 def test_lance_video_position_table_is_the_rollouts_table():
     """The 3-D table must be built exactly as vllm-omni builds it.
 
