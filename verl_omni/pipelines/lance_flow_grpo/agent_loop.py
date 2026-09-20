@@ -30,6 +30,7 @@ from typing import Any
 from verl.experimental.agent_loop.agent_loop import register
 
 from verl_omni.agent_loop.single_turn_agent_loop import DiffusionSingleTurnAgentLoop
+from verl_omni.agent_loop.utils import messages_to_text as _messages_to_text
 
 
 @register("lance_diffusion_single_turn_agent")
@@ -61,6 +62,26 @@ class LanceDiffusionSingleTurnAgentLoop(DiffusionSingleTurnAgentLoop):
                 elif kind == "audio":
                     media["audios"].append(item["audio"])
         return {key: values for key, values in media.items() if values}
+
+    async def ct_build_initial_tokens(
+        self,
+        messages: list[dict],
+        tools: list[dict] | None = None,
+        images: list[Any] | None = None,
+        videos: list[Any] | None = None,
+        audios: list[Any] | None = None,
+    ) -> list[int]:
+        """Tokenize the text only; the pipeline prefills the reference itself.
+
+        Handing the reference to the text encoder's processor would expand it
+        into prompt tokens - for Lance's checkpoint into a request-sized
+        sequence the rollout then rejects - while ``LancePipeline`` reads the
+        reference from ``multi_modal_data`` and builds its own vision and VAE
+        prefill around the instruction.
+        """
+        del tools, images, videos, audios
+        text_only = [{"role": message.get("role"), "content": _messages_to_text([message])} for message in messages]
+        return await super().ct_build_initial_tokens(text_only)
 
     def _assert_mm_supported(self, has_multi_modal: bool) -> None:
         """Allow reference media carried beside the prompt."""
