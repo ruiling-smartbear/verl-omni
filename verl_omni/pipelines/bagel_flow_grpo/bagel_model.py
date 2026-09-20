@@ -250,6 +250,7 @@ class BagelMoTAttention(nn.Module):
         latent_mask: Tensor,
         L_ctx: int = 0,
         key_padding_mask: Optional[Tensor] = None,
+        attn_plan: Optional[list[tuple[int, int, int, Optional[int]]]] = None,
     ) -> Tensor:
         B, L, _ = hidden_states.shape
         text_idx = text_mask.nonzero(as_tuple=True)
@@ -301,7 +302,37 @@ class BagelMoTAttention(nn.Module):
         k_normed = k_normed.transpose(1, 2)
         v = v.transpose(1, 2)
 
-        if L_ctx > 0:
+        if attn_plan is not None:
+            # A caller that replays a sequence prefilled in segments knows each
+            # block's key range and causality, which a single text/image split
+            # cannot express: Lance's edit context alternates causal text, a
+            # fully-visible reference, causal text, then the fully-visible latent
+            # block.  Each entry is (query_start, query_end, key_end, diagonal),
+            # where ``diagonal`` is the query-relative key bound for a causal
+            # block and ``None`` means every key up to ``key_end`` is visible.
+            blocks = []
+            for q_start, q_end, k_end, diagonal in attn_plan:
+                q_len = q_end - q_start
+                block_mask = None
+                if diagonal is not None:
+                    rows = torch.arange(q_len, device=hidden_states.device).unsqueeze(1)
+                    keys = torch.arange(k_end, device=hidden_states.device).unsqueeze(0)
+                    block_mask = keys <= (diagonal + rows)
+                    block_mask = block_mask.view(1, 1, q_len, k_end)
+                if key_padding_mask is not None:
+                    valid = key_padding_mask[:, :k_end].view(B, 1, 1, k_end)
+                    block_mask = valid if block_mask is None else (block_mask & valid)
+                blocks.append(
+                    F.scaled_dot_product_attention(
+                        q_normed[:, :, q_start:q_end],
+                        k_normed[:, :, :k_end],
+                        v[:, :, :k_end],
+                        attn_mask=block_mask,
+                        is_causal=False,
+                    )
+                )
+            attn_out = torch.cat(blocks, dim=2)
+        elif L_ctx > 0:
             if key_padding_mask is not None and not key_padding_mask.all():
                 # Official BAGEL packs prompts, so padded prompt keys do not exist there.
                 # Mask them in both branches to match packed attention semantics.
@@ -373,6 +404,7 @@ class BagelMoTLayer(nn.Module):
         latent_mask: Tensor,
         L_ctx: int = 0,
         key_padding_mask: Optional[Tensor] = None,
+        attn_plan: Optional[list[tuple[int, int, int, Optional[int]]]] = None,
     ) -> Tensor:
         """Forward pass with MoT-routed layernorm, attention, and MLP.
 
@@ -404,6 +436,7 @@ class BagelMoTLayer(nn.Module):
             latent_mask,
             L_ctx,
             key_padding_mask=key_padding_mask,
+            attn_plan=attn_plan,
         )
         hidden_states = hidden_states + attn_out
 

@@ -504,12 +504,8 @@ class LanceForTraining(BagelForTraining):
             dim=-1,
         )
 
-        soi_emb = self.embed_tokens(
-            torch.full((B, 1), self.config.start_of_image_id, dtype=torch.long, device=dev)
-        )
-        eoi_emb = self.embed_tokens(
-            torch.full((B, 1), self.config.end_of_image_id, dtype=torch.long, device=dev)
-        )
+        soi_emb = self.embed_tokens(torch.full((B, 1), self.config.start_of_image_id, dtype=torch.long, device=dev))
+        eoi_emb = self.embed_tokens(torch.full((B, 1), self.config.end_of_image_id, dtype=torch.long, device=dev))
         t_emb = self.time_embedder(timestep)
         pos_emb = self.latent_pos_embed(condition["condition_latent_grid"].to(dev))
         latent_embeds = self.vae2llm(hidden_states) + t_emb.unsqueeze(1) + pos_emb
@@ -536,10 +532,29 @@ class LanceForTraining(BagelForTraining):
             dim=1,
         )
 
+        # The rollout prefilled this sequence segment by segment: causal text, a
+        # fully-visible reference, causal text, then the fully-visible latent
+        # block.  A single causal split cannot express that, so hand the layers
+        # the block ranges (query_start, query_end, key_end, causal bound).
+        attn_plan = [
+            (0, L_prefix, L_prefix, 0),
+            (L_prefix, L_prefix + L_ref, L_prefix + L_ref, None),
+            (L_prefix + L_ref, L_ctx, L_ctx, L_prefix + L_ref),
+            (L_ctx, L_ctx + 2 + L_latent, L_ctx + 2 + L_latent, None),
+        ]
+
         for layer in self.layers:
 
             def _layer_fn(seq, pos_ids, text_mask_, latent_mask_, kpm, *, _layer=layer):
-                return _layer(seq, pos_ids, text_mask_, latent_mask_, L_ctx, key_padding_mask=kpm)
+                return _layer(
+                    seq,
+                    pos_ids,
+                    text_mask_,
+                    latent_mask_,
+                    L_ctx,
+                    key_padding_mask=kpm,
+                    attn_plan=attn_plan,
+                )
 
             sequence = self._checkpointed_call(
                 _layer_fn, sequence, position_ids, text_mask, latent_mask, key_padding_mask

@@ -145,18 +145,7 @@ class LanceDiffusion(BagelDiffusion):
         them.
         """
         if micro_batch is None or micro_batch.get("condition_ref_rows") is None:
-            if micro_batch is not None:
-                logger.warning(
-                    "LANCE_CONDITION absent; condition keys present: %s",
-                    sorted(key for key in micro_batch.keys() if str(key).startswith("condition")),
-                )
             return
-        logger.warning(
-            "LANCE_CONDITION present ref_rows=%s tail_ids=%s latent_positions=%s",
-            tuple(micro_batch["condition_ref_rows"].shape),
-            tuple(micro_batch["condition_gen_tail_ids"].shape),
-            tuple(micro_batch["condition_latent_positions"].shape),
-        )
         shared = {key: micro_batch[key] for key in cls._CONDITION_KEYS if micro_batch.get(key) is not None}
         for inputs, suffix in ((model_inputs, "gen"), (negative_model_inputs, "cfg")):
             inputs["condition"] = {
