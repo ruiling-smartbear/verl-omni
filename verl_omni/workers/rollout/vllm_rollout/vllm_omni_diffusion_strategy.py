@@ -181,8 +181,14 @@ class DiffusionStrategy(OmniStrategyBase):
         custom_prompt: OmniCustomPrompt = {"prompt_token_ids": prompt_ids}
         if prompt_mask is not None:
             custom_prompt["prompt_mask"] = prompt_mask
-        if len(default_params_list) > 1:
-            custom_prompt["modalities"] = ["image"]
+        # ``modalities`` is what the pipeline routes on (the Lance pipeline reads
+        # it to pick t2v / image_edit / x2t), so take it from the adapter's own
+        # declaration instead of assuming image.  Image models keep the previous
+        # behaviour of only setting it on a multi-stage engine.
+        io_spec = self._diffusion_io_spec()
+        primary_modality = io_spec.primary.modality if io_spec is not None else "image"
+        if len(default_params_list) > 1 or primary_modality != "image":
+            custom_prompt["modalities"] = [primary_modality]
         if negative_prompt_ids is not None:
             custom_prompt["negative_prompt_ids"] = negative_prompt_ids
         if extra_prompt_ids is not None:
