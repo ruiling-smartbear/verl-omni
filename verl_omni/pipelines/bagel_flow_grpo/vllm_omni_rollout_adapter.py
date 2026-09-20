@@ -428,6 +428,19 @@ class BagelPipelineWithLogProb(BagelPipeline):
         if traj_log_probs is not None:
             traj_log_probs = traj_log_probs.unsqueeze(0)
 
+        import sys as _sys
+
+        _raw = output.output
+        print(
+            "LANCEDBG wrapper output_type=%s output_keys=%s metadata_keys=%s"
+            % (
+                type(_raw).__name__,
+                sorted(_raw) if isinstance(_raw, dict) else None,
+                sorted((_raw.get("metadata") or {})) if isinstance(_raw, dict) else None,
+            ),
+            file=_sys.stderr,
+            flush=True,
+        )
         media = output.output
         media_key = "image"
         metadata = None

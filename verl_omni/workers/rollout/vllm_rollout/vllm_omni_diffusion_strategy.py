@@ -416,10 +416,16 @@ class DiffusionStrategy(OmniStrategyBase):
             extra_fields["all_timesteps"] = _maybe_unbatch(final_res.trajectory_timesteps)
         import sys as _sys
 
-        _groups = _rollout_metadata_groups(final_res.multimodal_output)
+        _mm = getattr(final_res, "multimodal_output", None)
+        _groups = _rollout_metadata_groups(_mm)
         print(
-            "LANCEDBG strategy rl_groups=%s keys=%s"
-            % (len(_groups), sorted(key for group in _groups for key in group)),
+            "LANCEDBG strategy mm_type=%s mm_keys=%s meta_keys=%s rl_groups=%s"
+            % (
+                type(_mm).__name__,
+                sorted(_mm) if isinstance(_mm, Mapping) else None,
+                sorted(_mm.get("metadata") or {}) if isinstance(_mm, Mapping) else None,
+                len(_groups),
+            ),
             file=_sys.stderr,
             flush=True,
         )
