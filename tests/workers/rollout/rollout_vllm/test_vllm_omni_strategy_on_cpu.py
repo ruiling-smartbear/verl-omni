@@ -810,6 +810,29 @@ def test_diffusion_strategy_applies_declared_media_keys(monkeypatch):
     assert prompt["modalities"] == ["video"]
 
 
+def test_diffusion_strategy_surfaces_rl_metadata_for_the_trainer(monkeypatch):
+    """An adapter's ``rl`` metadata reaches the batch the trainer replays from.
+
+    The envelope only forwards the ``rl`` and ``prompt_embeddings`` groups, so
+    anything a trainer needs on the replay side has to travel there.  Lance's
+    edit modes put the noise block's rotary anchor in that group.
+    """
+    strategy = DiffusionStrategy(SimpleNamespace(global_steps=1))
+    monkeypatch.setattr(strategy, "_diffusion_io_spec", lambda: DiffusionIOSpec(MediaSpec("image")))
+    final_res = SimpleNamespace(
+        images=[torch.zeros(3, 4, 4, dtype=torch.uint8)],
+        trajectory_latents=None,
+        trajectory_timesteps=None,
+        trajectory_log_probs=None,
+        multimodal_output={"metadata": {"rl": {"rope_anchor": torch.tensor([1330.0])}}},
+        request_output=None,
+    )
+
+    processed = strategy.process_output(final_res, None, {"output_type": "pt"})
+
+    assert float(processed.extra_fields["rope_anchor"]) == 1330.0
+
+
 def test_diffusion_strategy_announces_modality_when_the_adapter_routes_on_it(monkeypatch):
     """An image-conditioned pipeline that routes on ``modalities`` must be told.
 
