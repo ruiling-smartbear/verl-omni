@@ -492,12 +492,21 @@ class LanceForTraining(BagelForTraining):
         # Context rows carry one scalar rope id broadcast across (t, h, w); the
         # gen latent block's own positions - markers included - come verbatim.
         def broadcast(positions: Tensor) -> Tensor:
-            return positions.to(dev).reshape(B, -1).unsqueeze(1).expand(B, 3, -1)
+            positions = positions.to(dev).reshape(B, -1)
+            return positions.unsqueeze(1).expand(B, 3, -1)
+
+        def as_mrope(positions: Tensor) -> Tensor:
+            positions = positions.to(dev)
+            if positions.dim() == 3:
+                # Real per-axis (t, h, w) positions for a reference's image rows.
+                return positions if positions.shape[1] == 3 else positions.transpose(1, 2)
+            positions = positions.reshape(B, -1)
+            return positions.unsqueeze(1).expand(B, 3, -1)
 
         position_ids = torch.cat(
             [
                 broadcast(condition["condition_prefix_positions"]),
-                broadcast(condition["condition_ref_positions"]),
+                as_mrope(condition["condition_ref_positions"]),
                 broadcast(condition["condition_tail_positions"]),
                 condition["condition_latent_positions"].to(dev).expand(B, -1, -1),
             ],
