@@ -28,6 +28,7 @@ attribute on the BAGEL adapter.
 from __future__ import annotations
 
 import logging
+from types import SimpleNamespace
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.lance.pipeline_lance import LancePipeline
@@ -36,6 +37,7 @@ from verl_omni.pipelines.bagel_flow_grpo.vllm_omni_rollout_adapter import BagelP
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
+from verl_omni.workers.config import DiffusionModelConfig
 
 from .common import LANCE_TIMESTEP_SHIFT, setup_lance_sigmas
 
@@ -50,15 +52,39 @@ class LancePipelineWithLogProb(BagelPipelineWithLogProb, LancePipeline):
     replaces BAGEL's construction wholesale - so ``BagelPipelineWithLogProb``
     still reaches it through ``super().__init__`` and installs the SDE
     scheduler afterwards.
+
+    One class serves both Lance checkpoints, text-to-image and text-to-video,
+    because that is how vllm-omni ships them: ``Lance_3B`` and
+    ``Lance_3B_Video`` share the ``OmniLanceForConditionalGeneration``
+    architecture and differ only in the checkpoint the pipeline is pointed at.
+    The primary media stream is therefore resolved per run by
+    :meth:`flowgrpo_io_spec` rather than fixed per architecture.
     """
 
-    #: Text-to-image.  The video variant below declares ``video`` instead, which
-    #: the shared strategy turns into the ``modalities`` value the Lance pipeline
-    #: routes on to reach ``_forward_t2v``.
+    #: Text-to-image, overridden for the video checkpoint.  This is the value
+    #: the shared strategy turns into the ``modalities`` entry
+    #: ``LancePipeline.forward`` routes on, so it is what decides between the
+    #: image path and ``_forward_t2v``.
     diffusion_io_spec = DiffusionIOSpec(primary=MediaSpec("image"))
 
     #: Lance's rollout default (``LANCE_DEFAULTS.timestep_shift``).
     flowgrpo_timestep_shift: float = LANCE_TIMESTEP_SHIFT
+
+    @classmethod
+    def flowgrpo_io_spec(cls, model_config: DiffusionModelConfig) -> DiffusionIOSpec:
+        """Declare a video stream when the run is pointed at the video checkpoint.
+
+        ``LancePipeline`` picks its video variant from the model path
+        (``LancePipeline._select_video_variant``), and the rollout has to make
+        the same choice or a video checkpoint would be asked for a text-to-image
+        request.  Ask the pipeline itself for the decision instead of restating
+        its rule here, so the two cannot drift apart.
+        """
+        model = getattr(model_config, "local_path", None) or getattr(model_config, "path", "") or ""
+        od_config = SimpleNamespace(model=model, extra=getattr(model_config, "extra", None))
+        if LancePipeline._select_video_variant(od_config):
+            return DiffusionIOSpec(primary=MediaSpec("video"))
+        return cls.diffusion_io_spec
 
     @classmethod
     def flowgrpo_setup_sigmas(cls, scheduler: FlowMatchSDEDiscreteScheduler, num_steps: int, shift: float) -> None:
@@ -68,17 +94,3 @@ class LancePipelineWithLogProb(BagelPipelineWithLogProb, LancePipeline):
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
         logger.info("LancePipelineWithLogProb: SDE scheduler enabled, timestep_shift=%s", LANCE_TIMESTEP_SHIFT)
-
-
-@VllmOmniPipelineBase.register("OmniLanceForConditionalGeneration", algorithm="flow_grpo_t2v")
-class LanceVideoPipelineWithLogProb(LancePipelineWithLogProb):
-    """Text-to-video rollout for Lance.
-
-    Same pipeline, model construction and sigma schedule as the text-to-image
-    one; only the declared media stream differs.  ``LancePipeline.forward``
-    routes on ``modalities``, so this is what makes a t2v request reach
-    ``_forward_t2v`` instead of the image path.  The recipe selects it with
-    ``actor_rollout_ref.model.algorithm=flow_grpo_t2v``.
-    """
-
-    diffusion_io_spec = DiffusionIOSpec(primary=MediaSpec("video"))

@@ -248,7 +248,9 @@ class DiffusionStrategy(OmniStrategyBase):
             architecture=model_config.architecture,
             algorithm=model_config.algorithm,
         )
-        return getattr(pipeline_cls, "diffusion_io_spec", None)
+        if pipeline_cls is None:
+            return None
+        return pipeline_cls.flowgrpo_io_spec(model_config)
 
     def process_output(self, final_res: Any, params: Any, sampling_params: dict[str, Any]) -> DiffusionOutput:
         output_type = _diffusion_output_type(sampling_params)
