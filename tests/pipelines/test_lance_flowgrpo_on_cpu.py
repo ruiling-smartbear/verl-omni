@@ -91,14 +91,26 @@ def _tiny_config() -> LanceTrainingConfig:
     )
 
 
-def _write_tiny_checkpoint(root: str, *, subdir: str | None = "Lance_3B") -> str:
-    """Write a tiny Lance-layout checkpoint and return the bundle root."""
+def _write_tiny_checkpoint(
+    root: str,
+    *,
+    subdir: str | None = "Lance_3B",
+    max_latent_size: int = 8,
+    num_frames: int = 1,
+) -> str:
+    """Write a tiny Lance-layout checkpoint and return the bundle root.
+
+    ``max_latent_size`` and ``num_frames`` shape ``latent_pos_embed``, which is
+    how a real video checkpoint differs from the image one.
+    """
     ckpt_dir = os.path.join(root, subdir) if subdir else root
     os.makedirs(ckpt_dir, exist_ok=True)
     with open(os.path.join(ckpt_dir, "llm_config.json"), "w") as f:
         json.dump(TINY_LLM_CONFIG, f)
 
     config = _tiny_config()
+    config.max_latent_size = max_latent_size
+    config.max_num_frames = num_frames
     reference = LanceForTraining(config)
     state_dict = {}
     for name, tensor in reference.state_dict().items():
@@ -346,6 +358,35 @@ def test_lance_rollout_declares_video_for_the_video_checkpoint_only():
     # ``path`` is the fallback before ``local_path`` has been resolved.
     unresolved = SimpleNamespace(path=f"{bundle}/Lance_3B_Video")
     assert LancePipelineWithLogProb.flowgrpo_io_spec(unresolved).primary.modality == "video"
+
+
+def test_lance_video_position_table_is_the_rollouts_table():
+    """The 3-D table must be built exactly as vllm-omni builds it.
+
+    Both sides index the same ``t * side**2 + h * side + w`` rows and the
+    checkpoint replaces the values at load time, so the shape and the
+    ``(t, h, w)`` dimension split are what have to agree.
+    """
+    from vllm_omni.diffusion.models.lance.lance_transformer import LancePositionEmbedding3D as RolloutTable
+
+    from verl_omni.pipelines.lance_flow_grpo.lance_model import LancePositionEmbedding3D as TrainerTable
+
+    rollout_table = RolloutTable(3, 4, 48)
+    trainer_table = TrainerTable(3, 4, 48)
+    assert trainer_table.pos_embed.shape == rollout_table.pos_embed.shape == (3 * 4 * 4, 48)
+    assert torch.equal(trainer_table.pos_embed, rollout_table.pos_embed)
+
+
+def test_video_checkpoint_sizes_the_position_table_from_the_checkpoint(tmp_path):
+    """A multi-frame table must load into a model built for that many frames.
+
+    ``Lance_3B_Video`` stores ``31 * 64 * 64`` rows where the image table has
+    ``64 * 64``; a trainer that always builds the image table fails the load
+    with a size mismatch.
+    """
+    ckpt = _write_tiny_checkpoint(str(tmp_path), max_latent_size=64, num_frames=3)
+    model = LanceForTraining.from_pretrained(ckpt)
+    assert model.latent_pos_embed.pos_embed.shape == (3 * 64 * 64, TINY_LLM_CONFIG["hidden_size"])
 
 
 def test_trainer_rotary_is_the_rollouts_rotary():
