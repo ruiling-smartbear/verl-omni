@@ -780,6 +780,59 @@ def test_diffusion_strategy_preserves_multistage_prompt_shape():
 
 
 @pytest.mark.asyncio
+def test_diffusion_strategy_applies_declared_media_keys(monkeypatch):
+    """A conditioning stream reaches the pipeline under the key it reads.
+
+    ``multi_modal_data`` is assembled from modalities, so without the adapter's
+    declaration an image-conditioned pipeline that reads its reference frame
+    under a role name would never see it - Lance's i2v node reads
+    ``first_frame`` and falls back to text-to-video otherwise.
+    """
+    pipeline_cls = SimpleNamespace(
+        diffusion_io_spec=DiffusionIOSpec(primary=MediaSpec("video")),
+        flowgrpo_media_keys=staticmethod(lambda model_config: {"image": "first_frame"}),
+    )
+    monkeypatch.setattr(
+        diffusion_strategy_module.VllmOmniPipelineBase,
+        "get_class",
+        staticmethod(lambda **kwargs: pipeline_cls),
+    )
+    server = SimpleNamespace(
+        engine=SimpleNamespace(default_sampling_params_list=["diffusion-stage"]),
+        model_config=SimpleNamespace(architecture="Architecture", algorithm="Algorithm"),
+    )
+    strategy = DiffusionStrategy(server)
+    request = OmniRolloutRequest.from_generate_kwargs(prompt_ids=[1, 2], image_data=["frame"])
+
+    prompt, _ = strategy.preprocess_input(request, {}, None)
+
+    assert prompt["multi_modal_data"] == {"first_frame": ["frame"]}
+    assert prompt["modalities"] == ["video"]
+
+
+def test_diffusion_strategy_rejects_colliding_media_keys(monkeypatch):
+    """Two streams must not be renamed onto the same key silently."""
+    pipeline_cls = SimpleNamespace(
+        diffusion_io_spec=DiffusionIOSpec(primary=MediaSpec("video")),
+        flowgrpo_media_keys=staticmethod(lambda model_config: {"image": "video"}),
+    )
+    monkeypatch.setattr(
+        diffusion_strategy_module.VllmOmniPipelineBase,
+        "get_class",
+        staticmethod(lambda **kwargs: pipeline_cls),
+    )
+    server = SimpleNamespace(
+        engine=SimpleNamespace(default_sampling_params_list=["diffusion-stage"]),
+        model_config=SimpleNamespace(architecture="Architecture", algorithm="Algorithm"),
+    )
+    strategy = DiffusionStrategy(server)
+    request = OmniRolloutRequest.from_generate_kwargs(prompt_ids=[1, 2], image_data=["frame"], video_data=["clip"])
+
+    with pytest.raises(ValueError, match="collide after the adapter's rename"):
+        strategy.preprocess_input(request, {}, None)
+
+
+@pytest.mark.asyncio
 async def test_diffusion_strategy_rejects_nonzero_priority():
     strategy = DiffusionStrategy(SimpleNamespace())
 
