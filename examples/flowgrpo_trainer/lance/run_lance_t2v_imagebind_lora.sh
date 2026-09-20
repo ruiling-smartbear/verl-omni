@@ -6,10 +6,11 @@
 #   * model.path points at Lance_3B_Video.  The bundle root resolves to the image
 #     checkpoint first, and vllm-omni's Lance pipeline picks its video variant from
 #     a path ending in Lance_3B_Video, so both sides have to be given the video dir.
-#   * model.algorithm=flow_grpo_t2v selects the video adapters: the rollout one
-#     declares MediaSpec("video"), which the shared strategy turns into the
-#     modalities value LancePipeline.forward routes on, and the trainer one builds
-#     the 3-D latent positions for the replay.
+#     The rollout adapter reads the same checkpoint to declare a video stream, which
+#     the shared strategy turns into the modalities value LancePipeline.forward
+#     routes on; the trainer adapter needs no checkpoint knowledge because it adds
+#     the 3-D latent positions whenever the request carries more than one frame.
+#     algorithm stays flow_grpo: it is the loss family, and a modality is not one.
 #   * the reward is ImageBind in text_video mode rather than PickScore, matching
 #     every other video recipe in this repo (ltx2, minimax_h3).
 #
@@ -63,7 +64,7 @@ python3 -m verl_omni.trainer.main_diffusion \
     actor_rollout_ref.model.tokenizer_path=$tokenizer_name \
     actor_rollout_ref.model.custom_chat_template="\"$custom_chat_template\"" \
     +actor_rollout_ref.model.architecture=OmniLanceForConditionalGeneration \
-    actor_rollout_ref.model.algorithm=flow_grpo_t2v \
+    actor_rollout_ref.model.algorithm=flow_grpo \
     actor_rollout_ref.model.trust_remote_code=True \
     actor_rollout_ref.model.lora_rank=64 \
     actor_rollout_ref.model.lora_alpha=128 \

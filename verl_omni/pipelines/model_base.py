@@ -20,6 +20,7 @@ import torch
 from diffusers import ModelMixin, SchedulerMixin
 from tensordict import TensorDict
 
+from verl_omni.pipelines.rollout_media import DiffusionIOSpec
 from verl_omni.workers.config import DiffusionModelConfig
 
 logger = logging.getLogger(__name__)
@@ -452,6 +453,20 @@ class VllmOmniPipelineBase:
         if pipeline_cls is None:
             return None
         return f"{pipeline_cls.__module__}.{pipeline_cls.__qualname__}"
+
+    @classmethod
+    def flowgrpo_io_spec(cls, model_config: DiffusionModelConfig) -> Optional[DiffusionIOSpec]:
+        """Resolve the media I/O spec for the run described by ``model_config``.
+
+        Returns the class-level ``diffusion_io_spec`` by default, which is all a
+        model needs when its declared streams follow from the registered
+        ``(architecture, algorithm)`` pair. Override this when they instead
+        follow from the checkpoint: Lance is the case it exists for, because one
+        architecture (and one vllm-omni pipeline class) serves both the image
+        and the video checkpoint, so the primary modality cannot be a class
+        constant.
+        """
+        return getattr(cls, "diffusion_io_spec", None)
 
 
 class OmniModelBase(ABC):

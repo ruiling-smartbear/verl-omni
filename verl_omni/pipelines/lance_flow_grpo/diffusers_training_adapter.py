@@ -40,13 +40,12 @@ logger = logging.getLogger(__name__)
 
 
 @DiffusionModelBase.register("OmniLanceForConditionalGeneration", algorithm="flow_grpo")
-@DiffusionModelBase.register("OmniLanceForConditionalGeneration", algorithm="flow_grpo_t2v")
 class LanceDiffusion(BagelDiffusion):
     """DiffusionModelBase wrapper for :class:`LanceForTraining`.
 
-    Registered for both the image and the video algorithm keys: the adapter is
-    the same, and ``_get_latent_pos_ids`` adds the temporal axis whenever the
-    request carries more than one frame.
+    The image and the video checkpoint share this adapter: nothing here needs to
+    know which one is loaded, because ``_get_latent_pos_ids`` adds the temporal
+    axis whenever the request itself carries more than one frame.
     """
 
     @classmethod

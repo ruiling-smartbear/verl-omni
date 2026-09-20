@@ -324,6 +324,30 @@ def test_lance_adapter_asks_for_a_temporal_axis_only_on_video():
     assert int(video_ids.max()) == (_VIDEO_LATENT_FRAMES - 1) * 64 * 64 + 31 * 64 + 31
 
 
+def test_lance_rollout_declares_video_for_the_video_checkpoint_only():
+    """The rollout stream follows the checkpoint, as it does inside vllm-omni.
+
+    ``LancePipeline.forward`` only reaches ``_forward_t2v`` for a request whose
+    ``modalities`` carries ``video``, and the strategy builds that entry from the
+    adapter's spec.  Both Lance checkpoints share one architecture, so the spec
+    has to be resolved from the path the run was pointed at.
+    """
+    from verl_omni.pipelines.lance_flow_grpo.vllm_omni_rollout_adapter import LancePipelineWithLogProb
+
+    bundle = "/models/bytedance-research/Lance"
+
+    def modality(path: str) -> str:
+        return LancePipelineWithLogProb.flowgrpo_io_spec(SimpleNamespace(local_path=path)).primary.modality
+
+    assert modality(f"{bundle}/Lance_3B") == "image"
+    assert modality(f"{bundle}/Lance_3B_Video") == "video"
+    # A trailing separator must not hide the variant, as in vllm-omni.
+    assert modality(f"{bundle}/Lance_3B_Video/") == "video"
+    # ``path`` is the fallback before ``local_path`` has been resolved.
+    unresolved = SimpleNamespace(path=f"{bundle}/Lance_3B_Video")
+    assert LancePipelineWithLogProb.flowgrpo_io_spec(unresolved).primary.modality == "video"
+
+
 def test_trainer_rotary_is_the_rollouts_rotary():
     """The assembled cos/sin must equal what the rollout's module produces."""
     from vllm_omni.diffusion.models.bagel.bagel_transformer import BagelRotaryEmbedding
