@@ -144,7 +144,16 @@ class LanceDiffusion(BagelDiffusion):
         sequence with that segment removed, exactly as the pipeline prefilled
         them.
         """
-        if micro_batch is None or micro_batch.get("condition_ref_rows") is None:
+        import sys as _sys
+
+        _present = micro_batch is not None and micro_batch.get("condition_ref_rows") is not None
+        print(
+            "LANCEDBG trainer condition=%s batch_keys=%s"
+            % (_present, sorted(str(k) for k in micro_batch.keys()) if micro_batch is not None else None),
+            file=_sys.stderr,
+            flush=True,
+        )
+        if not _present:
             return
         shared = {key: micro_batch[key] for key in cls._CONDITION_KEYS if micro_batch.get(key) is not None}
         for inputs, suffix in ((model_inputs, "gen"), (negative_model_inputs, "cfg")):
