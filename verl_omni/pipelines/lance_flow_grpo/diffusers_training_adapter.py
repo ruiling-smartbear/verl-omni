@@ -121,7 +121,39 @@ class LanceDiffusion(BagelDiffusion):
         if rope_anchor is not None:
             model_inputs["position_anchor"] = rope_anchor
             negative_model_inputs["position_anchor"] = rope_anchor
+        cls._add_edit_condition(model_inputs, negative_model_inputs, micro_batch)
         return model_inputs, negative_model_inputs
+
+    #: Rollout-exported fields an image-edit trajectory replays with.
+    _CONDITION_KEYS = (
+        "condition_prefix_ids",
+        "condition_prefix_positions",
+        "condition_ref_rows",
+        "condition_ref_positions",
+        "condition_ref_is_gen",
+        "condition_latent_positions",
+        "condition_latent_grid",
+    )
+
+    @classmethod
+    def _add_edit_condition(cls, model_inputs, negative_model_inputs, micro_batch) -> None:
+        """Attach the exported reference rows, one tail per branch.
+
+        The two CFG branches share everything except the tail: the conditional
+        branch carries the instruction, the unconditional one is the same
+        sequence with that segment removed, exactly as the pipeline prefilled
+        them.
+        """
+        if micro_batch is None or micro_batch.get("condition_ref_rows") is None:
+            return
+        shared = {key: micro_batch[key] for key in cls._CONDITION_KEYS if micro_batch.get(key) is not None}
+        for inputs, suffix in ((model_inputs, "gen"), (negative_model_inputs, "cfg")):
+            inputs["condition"] = {
+                **shared,
+                "condition_tail_ids": micro_batch[f"condition_{suffix}_tail_ids"],
+                "condition_tail_positions": micro_batch[f"condition_{suffix}_tail_positions"],
+                "condition_tail_mask": micro_batch[f"condition_{suffix}_tail_mask"],
+            }
 
     @classmethod
     def _get_latent_pos_ids(cls, model_config: DiffusionModelConfig, module, device) -> torch.Tensor:

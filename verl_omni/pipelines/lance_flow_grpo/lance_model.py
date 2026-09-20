@@ -49,6 +49,7 @@ import logging
 import os
 from collections.abc import Sequence
 from dataclasses import dataclass
+from typing import Optional
 
 import numpy as np
 import torch
@@ -452,6 +453,105 @@ class LanceForTraining(BagelForTraining):
             torch.cat([text, anchor, anchor + 1 + cols, end], dim=-1),
         ]
         return torch.stack(axes, dim=1)
+
+    def forward(
+        self,
+        hidden_states: Tensor,
+        timestep: Tensor,
+        text_token_ids: Optional[Tensor] = None,
+        latent_pos_ids: Optional[Tensor] = None,
+        condition: dict | None = None,
+        **kwargs,
+    ) -> tuple[Tensor]:
+        """Replay a step, with or without rollout-exported conditioning rows.
+
+        ``condition`` carries what ``LancePipeline._forward_image_edit`` prefilled
+        through its ViT and VAE: this model has neither tower, so those rows and
+        the rotary basis they were placed on travel with the trajectory.  Without
+        it the plain text-to-image / text-to-video path runs unchanged.
+        """
+        if condition is None:
+            return super().forward(hidden_states, timestep, text_token_ids, latent_pos_ids, **kwargs)
+        return self._forward_conditioned(hidden_states, timestep, condition)
+
+    def _forward_conditioned(self, hidden_states: Tensor, timestep: Tensor, condition: dict) -> tuple[Tensor]:
+        """Assemble the edit context from exported rows and predict the velocity."""
+        B = hidden_states.shape[0]
+        L_latent = hidden_states.shape[1]
+        dev = hidden_states.device
+        rows_dtype = self.embed_tokens.weight.dtype
+
+        prefix = self.embed_tokens(condition["condition_prefix_ids"].to(dev))
+        tail = self.embed_tokens(condition["condition_tail_ids"].to(dev))
+        ref_rows = condition["condition_ref_rows"].to(device=dev, dtype=rows_dtype)
+        context = torch.cat([prefix, ref_rows, tail], dim=1)
+        L_prefix = prefix.shape[1]
+        L_ref = ref_rows.shape[1]
+        L_ctx = context.shape[1]
+
+        # Context rows carry one scalar rope id broadcast across (t, h, w); the
+        # gen latent block's own positions - markers included - come verbatim.
+        def broadcast(positions: Tensor) -> Tensor:
+            return positions.to(dev).reshape(B, -1).unsqueeze(1).expand(B, 3, -1)
+
+        position_ids = torch.cat(
+            [
+                broadcast(condition["condition_prefix_positions"]),
+                broadcast(condition["condition_ref_positions"]),
+                broadcast(condition["condition_tail_positions"]),
+                condition["condition_latent_positions"].to(dev).expand(B, -1, -1),
+            ],
+            dim=-1,
+        )
+
+        soi_emb = self.embed_tokens(
+            torch.full((B, 1), self.config.start_of_image_id, dtype=torch.long, device=dev)
+        )
+        eoi_emb = self.embed_tokens(
+            torch.full((B, 1), self.config.end_of_image_id, dtype=torch.long, device=dev)
+        )
+        t_emb = self.time_embedder(timestep)
+        pos_emb = self.latent_pos_embed(condition["condition_latent_grid"].to(dev))
+        latent_embeds = self.vae2llm(hidden_states) + t_emb.unsqueeze(1) + pos_emb
+        sequence = torch.cat([context, soi_emb, latent_embeds.to(soi_emb.dtype), eoi_emb], dim=1)
+
+        # Routing: the reference's VAE rows and the noise latents use the
+        # generation expert, everything else the understanding one.
+        is_gen_ctx = condition["condition_ref_is_gen"].to(dev)
+        text_mask = torch.ones(B, L_ctx + 2 + L_latent, dtype=torch.bool, device=dev)
+        text_mask[:, L_prefix : L_prefix + L_ref] = ~is_gen_ctx
+        text_mask[:, L_ctx + 1 : L_ctx + 1 + L_latent] = False  # noise latents are gen
+        text_mask[:, -1] = True  # end marker
+        latent_mask = ~text_mask
+
+        # Padded tail slots travel only to keep the batch rectangular; they must
+        # not be attended to.
+        keep = torch.ones(B, L_ctx, dtype=torch.bool, device=dev)
+        keep[:, L_prefix + L_ref :] = condition["condition_tail_mask"].to(dev)
+        key_padding_mask = torch.cat(
+            [
+                keep,
+                torch.ones(B, 2 + L_latent, dtype=torch.bool, device=dev),
+            ],
+            dim=1,
+        )
+
+        for layer in self.layers:
+
+            def _layer_fn(seq, pos_ids, text_mask_, latent_mask_, kpm, *, _layer=layer):
+                return _layer(seq, pos_ids, text_mask_, latent_mask_, L_ctx, key_padding_mask=kpm)
+
+            sequence = self._checkpointed_call(
+                _layer_fn, sequence, position_ids, text_mask, latent_mask, key_padding_mask
+            )
+
+        normed = sequence.new_zeros(sequence.shape)
+        t_idx = text_mask.nonzero(as_tuple=True)
+        l_idx = latent_mask.nonzero(as_tuple=True)
+        normed[t_idx] = self.norm(sequence[t_idx])
+        normed[l_idx] = self.norm_moe_gen(sequence[l_idx])
+        latent_output = normed[:, L_ctx + 1 : L_ctx + 1 + L_latent, :]
+        return (self.llm2vae(latent_output),)
 
     @classmethod
     def from_pretrained(cls, model_path: str, torch_dtype=torch.bfloat16) -> LanceForTraining:
