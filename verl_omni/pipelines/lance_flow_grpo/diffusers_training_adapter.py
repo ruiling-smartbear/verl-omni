@@ -83,6 +83,47 @@ class LanceDiffusion(BagelDiffusion):
         setup_lance_sigmas(scheduler, model_config.pipeline.num_inference_steps, device=device)
 
     @classmethod
+    def prepare_model_inputs(
+        cls,
+        module,
+        model_config: DiffusionModelConfig,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        prompt_embeds_mask: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor,
+        negative_prompt_embeds_mask: torch.Tensor,
+        micro_batch,
+        step: int,
+    ) -> tuple[dict, dict]:
+        """Pass the rollout's rotary anchor for the latent block into the replay.
+
+        ``LancePipeline._forward_image_edit`` and its video sibling anchor the
+        noise block at the reference's own positions rather than after the text,
+        so a replay that assumed the text length would rotate the whole block by
+        the length of the reference context.  The pipeline exports the value it
+        used and the trainer replays on that basis.  A run without the field
+        (text-to-image, text-to-video) is unaffected.
+        """
+        model_inputs, negative_model_inputs = super().prepare_model_inputs(
+            module,
+            model_config,
+            latents,
+            timesteps,
+            prompt_embeds,
+            prompt_embeds_mask,
+            negative_prompt_embeds,
+            negative_prompt_embeds_mask,
+            micro_batch,
+            step,
+        )
+        rope_anchor = micro_batch.get("rope_anchor") if micro_batch is not None else None
+        if rope_anchor is not None:
+            model_inputs["position_anchor"] = rope_anchor
+            negative_model_inputs["position_anchor"] = rope_anchor
+        return model_inputs, negative_model_inputs
+
+    @classmethod
     def _get_latent_pos_ids(cls, model_config: DiffusionModelConfig, module, device) -> torch.Tensor:
         """BAGEL's grid, extended with a temporal axis for video requests.
 

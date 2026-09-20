@@ -423,6 +423,38 @@ def test_lance_video_routing_picks_i2v_only_for_a_first_frame():
     assert node(["video"], {"image": frame}) == "t2v"
 
 
+def test_lance_positions_honor_the_rollouts_anchor():
+    """The latent block sits where the rollout put it, not after the text.
+
+    Lance's edit modes anchor the noise block at the reference VAE block's
+    positions, which is what lets the model map noise tokens onto reference
+    tokens; a replay that assumed the text length would rotate the whole block.
+    """
+    config = _tiny_config()
+    config.max_latent_size = 64
+    model = LanceForTraining(config)
+    latent_pos_ids = get_flattened_position_ids(_IMAGE_HW, _IMAGE_HW, _LATENT_DOWNSAMPLE, 64)
+    latent_pos_ids = latent_pos_ids.unsqueeze(0).expand(2, -1)
+    num_text = 5
+    anchor = torch.tensor([64, 96])
+
+    default = model.build_position_ids(2, num_text, latent_pos_ids.shape[1], latent_pos_ids, torch.device("cpu"))
+    shifted = model.build_position_ids(
+        2,
+        num_text,
+        latent_pos_ids.shape[1],
+        latent_pos_ids,
+        torch.device("cpu"),
+        text_attention_mask=torch.ones(2, num_text, dtype=torch.bool),
+        position_anchor=anchor,
+    )
+
+    # The text rows are untouched; every block row moves by the anchor delta.
+    assert torch.equal(default[:, :, :num_text], shifted[:, :, :num_text])
+    delta = (anchor - num_text).reshape(2, 1, 1)
+    assert torch.equal(shifted[:, :, num_text:], default[:, :, num_text:] + delta)
+
+
 def test_lance_video_position_table_is_the_rollouts_table():
     """The 3-D table must be built exactly as vllm-omni builds it.
 
