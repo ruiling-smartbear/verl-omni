@@ -428,6 +428,12 @@ class BagelMoTLayer(nn.Module):
         normed[text_idx] = self.input_layernorm(hidden_states[text_idx])
         normed[latent_idx] = self.input_layernorm_moe_gen(hidden_states[latent_idx])
 
+        # Only a replay that splices an exported context passes a plan; the SFT
+        # attention subclass shares this block and takes no ``attn_plan``, so the
+        # keyword is omitted when there is nothing to split.
+        attn_kwargs: dict = {"key_padding_mask": key_padding_mask}
+        if attn_plan is not None:
+            attn_kwargs["attn_plan"] = attn_plan
         attn_out = self.self_attn(
             normed,
             cos,
@@ -435,8 +441,7 @@ class BagelMoTLayer(nn.Module):
             text_mask,
             latent_mask,
             L_ctx,
-            key_padding_mask=key_padding_mask,
-            attn_plan=attn_plan,
+            **attn_kwargs,
         )
         hidden_states = hidden_states + attn_out
 
