@@ -96,6 +96,18 @@ class LancePipelineWithLogProb(BagelPipelineWithLogProb, LancePipeline):
         logger.info("LancePipelineWithLogProb: SDE scheduler enabled, timestep_shift=%s", LANCE_TIMESTEP_SHIFT)
 
     @classmethod
+    def flowgrpo_announces_modality(cls, model_config: DiffusionModelConfig) -> bool:
+        """Lance routes on ``modalities`` on both checkpoints.
+
+        On the image checkpoint a text-to-image request and an image-edit
+        request differ only in their conditioning stream, and the pipeline
+        dispatches on ``modalities``, so the image modality has to be announced
+        even though it is the default for a single-stage engine.
+        """
+        del model_config
+        return True
+
+    @classmethod
     def flowgrpo_media_keys(cls, model_config: DiffusionModelConfig) -> dict[str, str]:
         """Name a video run's reference frame the way the i2v node reads it.
 

@@ -810,6 +810,54 @@ def test_diffusion_strategy_applies_declared_media_keys(monkeypatch):
     assert prompt["modalities"] == ["video"]
 
 
+def test_diffusion_strategy_announces_modality_when_the_adapter_routes_on_it(monkeypatch):
+    """An image-conditioned pipeline that routes on ``modalities`` must be told.
+
+    On an image checkpoint a text-to-image request and an image-edit request
+    differ only in their conditioning stream, so without the announcement the
+    pipeline's dispatch drops the reference and silently generates text-to-image.
+    """
+    pipeline_cls = SimpleNamespace(
+        diffusion_io_spec=DiffusionIOSpec(primary=MediaSpec("image")),
+        flowgrpo_announces_modality=staticmethod(lambda model_config: True),
+    )
+    monkeypatch.setattr(
+        diffusion_strategy_module.VllmOmniPipelineBase,
+        "get_class",
+        staticmethod(lambda **kwargs: pipeline_cls),
+    )
+    server = SimpleNamespace(
+        engine=SimpleNamespace(default_sampling_params_list=["diffusion-stage"]),
+        model_config=SimpleNamespace(architecture="Architecture", algorithm="Algorithm"),
+    )
+    strategy = DiffusionStrategy(server)
+    request = OmniRolloutRequest.from_generate_kwargs(prompt_ids=[1, 2], image_data=["frame"])
+
+    prompt, _ = strategy.preprocess_input(request, {}, None)
+
+    assert prompt["modalities"] == ["image"]
+
+
+def test_diffusion_strategy_leaves_single_stage_image_requests_alone(monkeypatch):
+    """An adapter that does not route on ``modalities`` keeps the old request."""
+    pipeline_cls = SimpleNamespace(diffusion_io_spec=DiffusionIOSpec(primary=MediaSpec("image")))
+    monkeypatch.setattr(
+        diffusion_strategy_module.VllmOmniPipelineBase,
+        "get_class",
+        staticmethod(lambda **kwargs: pipeline_cls),
+    )
+    server = SimpleNamespace(
+        engine=SimpleNamespace(default_sampling_params_list=["diffusion-stage"]),
+        model_config=SimpleNamespace(architecture="Architecture", algorithm="Algorithm"),
+    )
+    strategy = DiffusionStrategy(server)
+    request = OmniRolloutRequest.from_generate_kwargs(prompt_ids=[1, 2])
+
+    prompt, _ = strategy.preprocess_input(request, {}, None)
+
+    assert "modalities" not in prompt
+
+
 def test_diffusion_strategy_rejects_colliding_media_keys(monkeypatch):
     """Two streams must not be renamed onto the same key silently."""
     pipeline_cls = SimpleNamespace(

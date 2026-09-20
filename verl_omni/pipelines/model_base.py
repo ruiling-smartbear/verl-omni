@@ -455,6 +455,22 @@ class VllmOmniPipelineBase:
         return f"{pipeline_cls.__module__}.{pipeline_cls.__qualname__}"
 
     @classmethod
+    def flowgrpo_announces_modality(cls, model_config: DiffusionModelConfig) -> bool:
+        """Whether the pipeline needs the request's primary modality announced.
+
+        A pipeline that routes on ``modalities`` has to be told what the request
+        asks for.  That is implied for a multi-stage engine and for any
+        non-image stream, but on an image checkpoint a text-to-image request and
+        an image-conditioned one are otherwise indistinguishable, and the
+        conditioning would be dropped silently.
+
+        Returns:
+            ``True`` to always set ``modalities`` from the adapter's media spec.
+        """
+        del model_config
+        return False
+
+    @classmethod
     def flowgrpo_media_keys(cls, model_config: DiffusionModelConfig) -> Mapping[str, str]:
         """Rename rollout media streams to the keys the pipeline reads them under.
 

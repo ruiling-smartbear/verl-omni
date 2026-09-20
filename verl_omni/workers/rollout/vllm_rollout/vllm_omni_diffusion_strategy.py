@@ -218,11 +218,12 @@ class DiffusionStrategy(OmniStrategyBase):
             custom_prompt["prompt_mask"] = prompt_mask
         # ``modalities`` is what the pipeline routes on (the Lance pipeline reads
         # it to pick t2v / image_edit / x2t), so take it from the adapter's own
-        # declaration instead of assuming image.  Image models keep the previous
-        # behaviour of only setting it on a multi-stage engine.
+        # declaration instead of assuming image.  An image stream only needs it
+        # on a multi-stage engine unless the adapter says its pipeline routes on
+        # it, which is where an image-edit request would be lost.
         io_spec = self._diffusion_io_spec()
         primary_modality = io_spec.primary.modality if io_spec is not None else "image"
-        if len(default_params_list) > 1 or primary_modality != "image":
+        if len(default_params_list) > 1 or primary_modality != "image" or self._diffusion_announces_modality():
             custom_prompt["modalities"] = [primary_modality]
         if negative_prompt_ids is not None:
             custom_prompt["negative_prompt_ids"] = negative_prompt_ids
@@ -268,6 +269,18 @@ class DiffusionStrategy(OmniStrategyBase):
                 sampling_params_list=params,
             )
         )
+
+    def _diffusion_announces_modality(self) -> bool:
+        """Whether the active adapter asks for its primary modality to be announced."""
+        model_config = getattr(self.server, "model_config", None)
+        if model_config is None:
+            return False
+        pipeline_cls = VllmOmniPipelineBase.get_class(
+            architecture=model_config.architecture,
+            algorithm=model_config.algorithm,
+        )
+        resolve = getattr(pipeline_cls, "flowgrpo_announces_modality", None) if pipeline_cls is not None else None
+        return bool(resolve(model_config)) if resolve is not None else False
 
     def _rename_media_keys(self, multi_modal_data: dict[str, Any]) -> dict[str, Any]:
         """Apply the adapter's media-key declaration to a rollout request.

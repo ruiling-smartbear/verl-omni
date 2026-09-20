@@ -380,10 +380,15 @@ def test_lance_video_request_hands_the_reference_frame_to_i2v():
     assert LancePipelineWithLogProb.flowgrpo_media_keys(unresolved) == {"image": "first_frame"}
     # The image checkpoint edits from the plain key, so nothing is renamed.
     assert LancePipelineWithLogProb.flowgrpo_media_keys(SimpleNamespace(local_path=f"{bundle}/Lance_3B")) == {}
-    # The base declaration is empty, so every other adapter is unaffected.
+    # Both checkpoints route on modalities, which is what tells the pipeline an
+    # image_edit request apart from a text-to-image one.
+    assert LancePipelineWithLogProb.flowgrpo_announces_modality(SimpleNamespace()) is True
+
+    # The base declarations are empty, so every other adapter is unaffected.
     from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 
     assert VllmOmniPipelineBase.flowgrpo_media_keys(SimpleNamespace()) == {}
+    assert VllmOmniPipelineBase.flowgrpo_announces_modality(SimpleNamespace()) is False
 
 
 def test_lance_video_routing_picks_i2v_only_for_a_first_frame():
