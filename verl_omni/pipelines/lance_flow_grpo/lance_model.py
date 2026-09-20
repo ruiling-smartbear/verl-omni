@@ -385,6 +385,7 @@ class LanceForTraining(BagelForTraining):
         device,
         *,
         text_attention_mask: Tensor | None = None,
+        position_anchor: Tensor | None = None,
     ) -> Tensor:
         """Per-token ``(t, h, w)`` positions, matching what the rollout feeds.
 
@@ -423,7 +424,11 @@ class LanceForTraining(BagelForTraining):
         within = grid % stride
         rows = torch.div(within, side, rounding_mode="floor")
         cols = within % side
-        if text_attention_mask is None:
+        if position_anchor is not None:
+            # The rollout's own anchor for this block (Lance's edit modes place the
+            # noise latents at the reference VAE block's positions).
+            anchor = position_anchor.to(device=device, dtype=torch.long).reshape(batch, 1)
+        elif text_attention_mask is None:
             anchor = grid.new_full((batch, 1), num_text)
         else:
             anchor = text_attention_mask.to(device=device, dtype=torch.bool).sum(dim=-1, keepdim=True)

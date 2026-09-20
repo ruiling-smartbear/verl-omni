@@ -506,6 +506,7 @@ class BagelForTraining(NonDiffusersModelBase):
         device,
         *,
         text_attention_mask: Optional[Tensor] = None,
+        position_anchor: Optional[Tensor] = None,
     ) -> Tensor:
         """RoPE positions for text + start marker + latents + end marker.
 
@@ -527,9 +528,15 @@ class BagelForTraining(NonDiffusersModelBase):
             ``(B, L_total)`` positions, or any shape the rotary accepts.
         """
         total = num_text + 1 + num_latent + 1
+        # A rollout may anchor the latent block somewhere other than after the
+        # text (Lance's edit modes anchor it at the reference block), so let the
+        # caller pass the value the trajectory was actually produced with.
+        anchor = num_text if position_anchor is None else position_anchor
         if num_text > 0:
             ctx_pos = torch.arange(num_text, device=device)
-            img_pos = ctx_pos.new_full((1 + num_latent + 1,), num_text)
+            img_pos = torch.as_tensor(anchor, device=device, dtype=torch.long).reshape(-1)
+            img_pos = img_pos[0] if img_pos.numel() == 1 else img_pos
+            img_pos = ctx_pos.new_full((1 + num_latent + 1,), img_pos)
             return torch.cat([ctx_pos, img_pos]).unsqueeze(0).expand(batch, -1)
         return torch.zeros(1, total, dtype=torch.long, device=device).expand(batch, -1)
 
@@ -539,6 +546,7 @@ class BagelForTraining(NonDiffusersModelBase):
         timestep: Tensor,
         text_token_ids: Optional[Tensor],
         latent_pos_ids: Tensor,
+        position_anchor: Optional[Tensor] = None,
         **kwargs,
     ) -> tuple[Tensor]:
         """Forward pass.
@@ -608,7 +616,13 @@ class BagelForTraining(NonDiffusersModelBase):
 
         # 6. RoPE positions
         position_ids = self.build_position_ids(
-            B, L_ctx, L_latent, latent_pos_ids, dev, text_attention_mask=text_attention_mask
+            B,
+            L_ctx,
+            L_latent,
+            latent_pos_ids,
+            dev,
+            text_attention_mask=text_attention_mask,
+            position_anchor=position_anchor,
         )
 
         # Key padding mask: zero-padded text tokens in uneven micro-batches
