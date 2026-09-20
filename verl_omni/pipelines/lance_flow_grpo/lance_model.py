@@ -50,13 +50,16 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import numpy as np
 import torch
+import torch.nn as nn
 from torch import Tensor
 
 from verl_omni.pipelines.bagel_flow_grpo.bagel_model import (
     BagelForTraining,
     BagelTrainingConfig,
     RotaryEmbedding,
+    _get_1d_sincos_pos_embed_from_grid,
 )
 
 from .common import (
@@ -92,6 +95,10 @@ class LanceTrainingConfig(BagelTrainingConfig):
     hidden_size: int = 2048
     latent_patch_size: int = LANCE_LATENT_PATCH_SIZE
     max_latent_size: int = LANCE_MAX_LATENT_SIZE
+    #: Latent frames covered by ``latent_pos_embed``.  One frame is the image
+    #: table; Lance_3B_Video ships a 3-D table of 31.  ``from_pretrained`` takes
+    #: the value from the checkpoint, so a caller does not set this by hand.
+    max_num_frames: int = 1
     latent_channel: int = LANCE_VAE_Z_CHANNELS
     vae_downsample: int = LANCE_VAE_DOWNSAMPLE_SPATIAL
     #: Video VAE temporal stride; ``latent_frames = (num_frames - 1) // this + 1``.
@@ -301,6 +308,48 @@ class LanceRotaryEmbedding(RotaryEmbedding):
         return cos, sin
 
 
+def get_3d_sincos_pos_embed(embed_dim: int, t: int, h: int, w: int) -> np.ndarray:
+    """3-D sin-cos positional embedding over ``(t, h, w)``.
+
+    The dimension split matches vllm-omni's
+    ``lance_transformer.get_3d_sincos_pos_embed`` and upstream Lance
+    ``modeling/lance/modeling_utils.py``; the checkpoint supplies the values, so
+    this only has to build the table at the shape the checkpoint uses.
+    """
+    tt, hh, ww = np.meshgrid(
+        np.arange(t, dtype=np.float32),
+        np.arange(h, dtype=np.float32),
+        np.arange(w, dtype=np.float32),
+        indexing="ij",
+    )
+    d = embed_dim // 3
+    d = d if d % 2 == 0 else d - 1
+    emb_t = _get_1d_sincos_pos_embed_from_grid(d, tt)
+    emb_h = _get_1d_sincos_pos_embed_from_grid(d, hh)
+    emb_w = _get_1d_sincos_pos_embed_from_grid(embed_dim - 2 * d, ww)
+    return np.concatenate([emb_t, emb_h, emb_w], axis=1)
+
+
+class LancePositionEmbedding3D(nn.Module):
+    """Frozen 3-D latent position embedding, matching the rollout's table.
+
+    BAGEL ships a 2-D table for image latents; ``Lance_3B_Video`` adds a
+    temporal axis and stores ``(max_num_frames * side**2, hidden)`` rows, which
+    the trainer indexes with the same flattened ``t * side**2 + h * side + w``
+    ids the rollout uses.  The image checkpoint's table is the ``t = 1`` case.
+    """
+
+    def __init__(self, max_num_frames: int, max_num_patch_per_side: int, hidden_size: int):
+        super().__init__()
+        n = max_num_frames * max_num_patch_per_side * max_num_patch_per_side
+        self.pos_embed = nn.Parameter(torch.zeros(n, hidden_size), requires_grad=False)
+        table = get_3d_sincos_pos_embed(hidden_size, max_num_frames, max_num_patch_per_side, max_num_patch_per_side)
+        self.pos_embed.data.copy_(torch.from_numpy(table).float())
+
+    def forward(self, position_ids: Tensor) -> Tensor:
+        return self.pos_embed[position_ids]
+
+
 class LanceForTraining(BagelForTraining):
     """Lance MoT module for FlowGRPO FSDP training.
 
@@ -310,6 +359,12 @@ class LanceForTraining(BagelForTraining):
 
     def __init__(self, config: LanceTrainingConfig):
         super().__init__(config)
+        if config.max_num_frames > 1:
+            # The base built BAGEL's image table; a video checkpoint's table
+            # covers every frame, so rebuild it at the checkpoint's row count.
+            self.latent_pos_embed = LancePositionEmbedding3D(
+                config.max_num_frames, config.max_latent_size, config.hidden_size
+            )
         # The rollout runs the generation block through Qwen2.5-VL mRoPE.  The
         # BAGEL layer builds a 1-D rotary, so swap the module per layer rather
         # than duplicate the layer class; everything else about the layer is
@@ -430,6 +485,7 @@ class LanceForTraining(BagelForTraining):
                 # ``(max_num_frames * side**2, hidden)``.  One frame is the image
                 # table; the video checkpoint carries 31 frames (``126976`` rows).
                 frames = rows // (side * side)
+                config.max_num_frames = frames
                 if frames > 1:
                     logger.info(
                         "Lance checkpoint carries a %d-frame video position table (%d rows, side %d).",
