@@ -114,24 +114,38 @@ class BagelTrainingConfig:
         )
 
 
-def get_flattened_position_ids(img_h: int, img_w: int, patch_size: int, max_num_patches_per_side: int) -> torch.Tensor:
-    """Compute flattened 2-D position IDs for latent patches.
+def get_flattened_position_ids(
+    img_h: int,
+    img_w: int,
+    patch_size: int,
+    max_num_patches_per_side: int,
+    num_frames: int = 1,
+) -> torch.Tensor:
+    """Compute flattened position IDs for latent patches.
 
     Args:
         img_h: Image height in pixels.
         img_w: Image width in pixels.
         patch_size: Latent patch size (VAE downsample × latent_patch_size).
         max_num_patches_per_side: Max grid size for position embedding.
+        num_frames: Latent frames.  1 reproduces the 2-D image grid; more adds a
+            temporal axis, giving the ``t * side**2 + h * side + w`` rows that the
+            3-D position table is built with (``get_3d_sincos_pos_embed`` is
+            called with ``(max_num_frames, side, side)``, so one frame is just the
+            image table).
 
     Returns:
-        Flattened position IDs of shape ``(num_patches,)``.
+        Flattened position IDs of shape ``(num_frames * num_patches,)``.
     """
     num_patches_h = img_h // patch_size
     num_patches_w = img_w // patch_size
     coords_h = torch.arange(0, num_patches_h)
     coords_w = torch.arange(0, num_patches_w)
-    pos_ids = (coords_h[:, None] * max_num_patches_per_side + coords_w).flatten()
-    return pos_ids
+    per_frame = (coords_h[:, None] * max_num_patches_per_side + coords_w).flatten()
+    if num_frames <= 1:
+        return per_frame
+    stride = max_num_patches_per_side * max_num_patches_per_side
+    return (torch.arange(0, num_frames)[:, None] * stride + per_frame).flatten()
 
 
 # ===================================================================

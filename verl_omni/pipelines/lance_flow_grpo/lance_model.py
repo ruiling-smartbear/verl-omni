@@ -63,7 +63,9 @@ from .common import (
     LANCE_LATENT_PATCH_SIZE,
     LANCE_MAX_LATENT_SIZE,
     LANCE_MROPE_SECTION,
+    LANCE_TEMPORAL_ROPE_SCALE,
     LANCE_VAE_DOWNSAMPLE_SPATIAL,
+    LANCE_VAE_DOWNSAMPLE_TEMPORAL,
     LANCE_VAE_Z_CHANNELS,
 )
 
@@ -92,6 +94,8 @@ class LanceTrainingConfig(BagelTrainingConfig):
     max_latent_size: int = LANCE_MAX_LATENT_SIZE
     latent_channel: int = LANCE_VAE_Z_CHANNELS
     vae_downsample: int = LANCE_VAE_DOWNSAMPLE_SPATIAL
+    #: Video VAE temporal stride; ``latent_frames = (num_frames - 1) // this + 1``.
+    vae_downsample_temporal: int = LANCE_VAE_DOWNSAMPLE_TEMPORAL
     #: Head-dimension split across the (t, h, w) rotary axes.  Read from
     #: ``rope_scaling`` when the checkpoint carries it, so the trainer uses
     #: the split the rollout configures rather than a copy of it.
@@ -359,17 +363,28 @@ class LanceForTraining(BagelForTraining):
         if grid.shape != (batch, num_latent):
             raise ValueError(f"latent_pos_ids has shape {tuple(grid.shape)}, expected {(batch, num_latent)}")
         side = int(self.config.max_latent_size)
-        rows = torch.div(grid, side, rounding_mode="floor")
-        cols = grid % side
+        stride = side * side
+        frames = torch.div(grid, stride, rounding_mode="floor")
+        within = grid % stride
+        rows = torch.div(within, side, rounding_mode="floor")
+        cols = within % side
         if text_attention_mask is None:
             anchor = grid.new_full((batch, 1), num_text)
         else:
             anchor = text_attention_mask.to(device=device, dtype=torch.bool).sum(dim=-1, keepdim=True)
-        max_hw = torch.maximum(rows.amax(dim=-1, keepdim=True), cols.amax(dim=-1, keepdim=True)) + 1
+
+        # Extents and the end marker, mirroring
+        # ``LanceBagel._per_token_mrope_for_video_latent``.  A single frame leaves
+        # the temporal term at zero, so the image path is unchanged: max_thw
+        # collapses to max(h, w) and latent_t to anchor + 1.
+        t_lat = frames.amax(dim=-1, keepdim=True) + 1
+        h_lat = rows.amax(dim=-1, keepdim=True) + 1
+        w_lat = cols.amax(dim=-1, keepdim=True) + 1
+        max_thw = torch.maximum((t_lat - 1) * LANCE_TEMPORAL_ROPE_SCALE, torch.maximum(h_lat, w_lat) - 1) + 1
 
         text = torch.arange(num_text, device=device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
-        end = anchor + max_hw + 1
-        latent_t = (anchor + 1).expand(-1, num_latent)
+        end = anchor + max_thw + 1
+        latent_t = anchor + 1 + frames * LANCE_TEMPORAL_ROPE_SCALE
 
         axes = [
             torch.cat([text, anchor, latent_t, end], dim=-1),
@@ -409,15 +424,31 @@ class LanceForTraining(BagelForTraining):
 
         pos_embed = mapped.get("latent_pos_embed.pos_embed")
         if pos_embed is not None:
-            grid = int(round(pos_embed.shape[0] ** 0.5))
-            if grid * grid != pos_embed.shape[0]:
-                raise ValueError(
-                    f"latent_pos_embed.pos_embed has {pos_embed.shape[0]} rows, which is not a square "
-                    "grid; this is the 3-D video table, which the image path does not support."
-                )
-            if grid != config.max_latent_size:
-                logger.info("Lance checkpoint carries max_latent_size=%d, overriding %d.", grid, config.max_latent_size)
-                config.max_latent_size = grid
+            rows = int(pos_embed.shape[0])
+            side = int(config.max_latent_size)
+            if rows % (side * side) == 0:
+                # ``(max_num_frames * side**2, hidden)``.  One frame is the image
+                # table; the video checkpoint carries 31 frames (``126976`` rows).
+                frames = rows // (side * side)
+                if frames > 1:
+                    logger.info(
+                        "Lance checkpoint carries a %d-frame video position table (%d rows, side %d).",
+                        frames,
+                        rows,
+                        side,
+                    )
+            else:
+                grid = int(round(rows**0.5))
+                if grid * grid != rows:
+                    raise ValueError(
+                        f"latent_pos_embed.pos_embed has {rows} rows, which is neither a square grid nor "
+                        f"a whole number of frames at max_latent_size={side}."
+                    )
+                if grid != config.max_latent_size:
+                    logger.info(
+                        "Lance checkpoint carries max_latent_size=%d, overriding %d.", grid, config.max_latent_size
+                    )
+                    config.max_latent_size = grid
 
         model = cls(config)
         model.load_state_dict(mapped, strict=True)

@@ -40,8 +40,21 @@ LANCE_LATENT_PATCH_SIZE = 1
 LANCE_VAE_Z_CHANNELS = 48
 LANCE_VAE_DOWNSAMPLE_SPATIAL = 16
 
+#: Wan2.2 video VAE temporal stride.  The rollout reads it from the checkpoint's
+#: ``vae_config.downsample_temporal``; the trainer loads no VAE, so it carries the
+#: value as a constant next to the spatial one.  Latent frames for ``T`` pixel
+#: frames are ``(T - 1) // LANCE_VAE_DOWNSAMPLE_TEMPORAL + 1``.
+LANCE_VAE_DOWNSAMPLE_TEMPORAL = 4
+
 #: ``latent_pos_embed.pos_embed`` ships as ``(4096, 2048) = (64 * 64, hidden)``.
 LANCE_MAX_LATENT_SIZE = 64
+
+#: The temporal rotary axis is amplified by this factor so neighbouring latent
+#: frames stay well separated, matching the upstream Qwen2.5-VL rope convention.
+#: ``LanceBagel._per_token_mrope_for_video_latent`` computes it as
+#: ``LANCE_TOKENS_PER_SECOND * LANCE_SECONDS_PER_GRID`` (2 * 1.0) in vllm-omni;
+#: the trainer has to place the same values, so keep the product here.
+LANCE_TEMPORAL_ROPE_SCALE = 2
 
 #: Schedule points Lance samples beyond ``num_inference_steps``; mirrors
 #: ``LanceBagel._denoise_schedule_extra_step``, which a test pins.
