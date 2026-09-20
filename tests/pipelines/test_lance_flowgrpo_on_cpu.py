@@ -431,7 +431,7 @@ def _synthetic_edit_condition(
         "condition_prefix_ids": torch.randint(1, 190, (batch, prefix)),
         "condition_prefix_positions": torch.arange(prefix).expand(batch, -1),
         "condition_ref_rows": torch.randn(batch, ref, hidden),
-        "condition_ref_positions": torch.arange(prefix, prefix + ref).expand(batch, -1),
+        "condition_ref_positions": torch.arange(prefix, prefix + ref).expand(3, -1).unsqueeze(0).expand(batch, -1, -1),
         "condition_ref_is_gen": torch.cat(
             [torch.zeros(batch, ref - 2, dtype=torch.bool), torch.ones(batch, 2, dtype=torch.bool)], dim=1
         ),
