@@ -33,7 +33,10 @@ tokenizer_name=$WORKSPACE/data/pickscore/lance/tokenizer
 # That tokenizer ships no chat_template, and the agent loop renders every
 # prompt through one.  A user turn in Qwen's ChatML layout is what the rollout
 # adapter's _extract_prompt_text pulls the caption back out of.
-custom_chat_template='{% for message in messages %}{% if message['\''role'\''] == '\''user'\'' %}<|im_start|>user\n{{ message['\''content'\''] }}<|im_end|>\n{% endif %}{% endfor %}'
+# Literal newlines must survive both shell and Hydra parsing.
+custom_chat_template='{% for message in messages %}{% if message['\''role'\''] == '\''user'\'' %}<|im_start|>user
+{{ message['\''content'\''] }}<|im_end|>
+{% endif %}{% endfor %}'
 reward_function_path=verl_omni/utils/reward_score/pickscore_reward.py
 
 NUM_GPUS_ACTOR_ROLLOUT_REWARD=4
@@ -49,6 +52,8 @@ python3 -m verl_omni.trainer.main_diffusion \
     data.val_files=$pickscore_test_path \
     data.train_batch_size=48 \
     data.max_prompt_length=256 \
+    data.filter_overlong_prompts=True \
+    +data.apply_chat_template_kwargs.chat_template="\"$custom_chat_template\"" \
     data.trust_remote_code=True \
     algorithm.global_std=False \
     actor_rollout_ref.model.path=$model_name \

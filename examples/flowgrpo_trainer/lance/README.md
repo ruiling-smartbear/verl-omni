@@ -88,6 +88,16 @@ python3 examples/flowgrpo_trainer/data_process/lance_pickscore.py \
 This produces `$WORKSPACE/data/pickscore/lance/train.parquet` and
 `test.parquet`.
 
+The run script filters captions whose complete chat-formatted prompt exceeds
+256 tokens, using the same template as the rollout. This prevents the actor's
+precomputed token prefix from being paired with a left-truncated rollout
+prompt. Existing parquet files can be reused with the default 256-token data
+prep setting. If changing the limit, regenerate the data with the same
+`--max_prompt_length` and update `data.max_prompt_length` in the run command.
+Keep the template's literal newlines: a literal backslash followed by `n`
+becomes prompt text and also turns the blank negative prompt into a nonempty
+condition.
+
 ### Run LoRA training
 
 ```bash
