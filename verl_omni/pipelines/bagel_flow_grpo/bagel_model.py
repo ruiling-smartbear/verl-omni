@@ -490,7 +490,9 @@ class TimestepEmbedder(nn.Module):
     def forward(self, t: Tensor) -> Tensor:
         half = self.freq_dim // 2
         freqs = torch.exp(-math.log(10000) * torch.arange(half, dtype=torch.float32, device=t.device) / half)
-        args = t[:, None].float() * freqs[None]
+        # ``t`` is one sigma per sample, or one per token when a replay pins part
+        # of the latent block; both keep their leading dims.
+        args = t[..., None].float() * freqs
         emb = torch.cat([torch.cos(args), torch.sin(args)], dim=-1)
         emb = emb.to(self.mlp[0].weight.dtype)
         return self.mlp(emb)
@@ -634,7 +636,9 @@ class BagelForTraining(NonDiffusersModelBase):
         # 3. Latent projection
         t_emb = self.time_embedder(timestep)
         pos_emb = self.latent_pos_embed(latent_pos_ids)
-        latent_embeds = self.vae2llm(hidden_states) + t_emb.unsqueeze(1) + pos_emb
+        if t_emb.ndim == 2:
+            t_emb = t_emb.unsqueeze(1)
+        latent_embeds = self.vae2llm(hidden_states) + t_emb + pos_emb
         latent_embeds = latent_embeds.to(soi_emb.dtype)
 
         # 4. Sequence: [text?, soi, latent_0..N, eoi]

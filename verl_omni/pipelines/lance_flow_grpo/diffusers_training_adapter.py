@@ -121,8 +121,32 @@ class LanceDiffusion(BagelDiffusion):
         if rope_anchor is not None:
             model_inputs["position_anchor"] = rope_anchor
             negative_model_inputs["position_anchor"] = rope_anchor
+        cls._pin_first_frame(model_inputs, negative_model_inputs, micro_batch)
         cls._add_edit_condition(model_inputs, negative_model_inputs, micro_batch)
         return model_inputs, negative_model_inputs
+
+    @classmethod
+    def _pin_first_frame(cls, model_inputs, negative_model_inputs, micro_batch) -> None:
+        """Hold the image-to-video pin's tokens at ``timestep = 0`` in the replay.
+
+        The rollout pins the first latent frame: the sampler applies zero sigma
+        there and restores the pinned values after every step, so the rollout's
+        velocity at those tokens is the one at ``t = 0``.  A replay that used the
+        step's sigma everywhere would score a different velocity for a seventh of
+        the block - which is exactly where image-to-video's log-prob difference
+        was an order of magnitude looser than the two edit modes.  The pinned
+        values themselves need no export: the recorded latents already hold them.
+        """
+        pinned = micro_batch.get("frame_condition_token_indexes") if micro_batch is not None else None
+        if pinned is None:
+            return
+        indexes = pinned.reshape(-1).to(model_inputs["hidden_states"].device, torch.long)
+        latent_tokens = model_inputs["hidden_states"].shape[1]
+        for inputs in (model_inputs, negative_model_inputs):
+            timestep = inputs["timestep"]
+            if timestep.ndim == 1:
+                timestep = timestep[:, None].expand(-1, latent_tokens)
+            inputs["timestep"] = timestep.clone().index_fill(-1, indexes, 0.0)
 
     #: Rollout-exported fields an image-edit trajectory replays with.
     _CONDITION_KEYS = (
