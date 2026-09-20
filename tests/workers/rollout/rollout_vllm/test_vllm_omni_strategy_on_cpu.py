@@ -833,6 +833,31 @@ def test_diffusion_strategy_surfaces_rl_metadata_for_the_trainer(monkeypatch):
     assert float(processed.extra_fields["rope_anchor"]) == 1330.0
 
 
+def test_diffusion_strategy_unbatches_row_shaped_rl_fields(monkeypatch):
+    """An ``rl`` field arrives one sample deep and is unbatched for the trainer.
+
+    The rollout transport carries one sample per request, so a field like the
+    reference rows an edit replay needs must be shaped ``(1, L, D)``; a bare
+    ``(L, D)`` would be unbatched into a single row and reach the trainer as
+    garbage.  The trainer then sees ``(L, D)`` again.
+    """
+    strategy = DiffusionStrategy(SimpleNamespace(global_steps=1))
+    monkeypatch.setattr(strategy, "_diffusion_io_spec", lambda: DiffusionIOSpec(MediaSpec("image")))
+    ref_rows = torch.zeros(1, 6, 4)
+    final_res = SimpleNamespace(
+        images=[torch.zeros(3, 4, 4, dtype=torch.uint8)],
+        trajectory_latents=None,
+        trajectory_timesteps=None,
+        trajectory_log_probs=None,
+        multimodal_output={"metadata": {"rl": {"condition_ref_rows": ref_rows}}},
+        request_output=None,
+    )
+
+    processed = strategy.process_output(final_res, None, {"output_type": "pt"})
+
+    assert processed.extra_fields["condition_ref_rows"].shape == (6, 4)
+
+
 def test_diffusion_strategy_announces_modality_when_the_adapter_routes_on_it(monkeypatch):
     """An image-conditioned pipeline that routes on ``modalities`` must be told.
 
