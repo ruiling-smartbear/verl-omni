@@ -405,6 +405,38 @@ def test_lance_video_request_hands_the_reference_frame_to_i2v():
         )
 
 
+def test_lance_video_routing_picks_i2v_only_for_a_first_frame():
+    """The routing the reference-frame rename exists for, asserted directly.
+
+    ``LancePipeline.forward`` dispatches a video request to ``_forward_i2v``
+    only when the frame sits under ``first_frame``; the plain ``image`` key the
+    rollout transport produces falls through to text-to-video and the reference
+    is dropped without an error.  That is why the adapter renames it.
+    """
+    from vllm_omni.diffusion.models.lance.pipeline_lance import LancePipeline
+
+    calls: list[str] = []
+    stub = SimpleNamespace(
+        _forward_i2v=lambda req: calls.append("i2v"),
+        _forward_video_edit=lambda req: calls.append("video_edit"),
+        _forward_t2v=lambda req: calls.append("t2v"),
+    )
+
+    def node(modalities: list[str], multi_modal_data: dict) -> str:
+        calls.clear()
+        request = SimpleNamespace(prompts=[{"modalities": modalities, "multi_modal_data": multi_modal_data}])
+        LancePipeline.forward(stub, request)
+        return calls[-1]
+
+    frame = object()
+    assert node(["video"], {"first_frame": frame}) == "i2v"
+    assert node(["video"], {"video": "clip.mp4"}) == "video_edit"
+    assert node(["video"], {}) == "t2v"
+    # The silent fallback the rename removes: a frame under the transport's own
+    # key reaches text-to-video instead of image-to-video.
+    assert node(["video"], {"image": frame}) == "t2v"
+
+
 def test_lance_video_position_table_is_the_rollouts_table():
     """The 3-D table must be built exactly as vllm-omni builds it.
 
