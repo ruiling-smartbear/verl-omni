@@ -52,8 +52,9 @@ class LancePipelineWithLogProb(BagelPipelineWithLogProb, LancePipeline):
     scheduler afterwards.
     """
 
-    #: Text-to-image only in this milestone; the video path needs 3-D latent
-    #: positions on the training side and is tracked separately.
+    #: Text-to-image.  The video variant below declares ``video`` instead, which
+    #: the shared strategy turns into the ``modalities`` value the Lance pipeline
+    #: routes on to reach ``_forward_t2v``.
     diffusion_io_spec = DiffusionIOSpec(primary=MediaSpec("image"))
 
     #: Lance's rollout default (``LANCE_DEFAULTS.timestep_shift``).
@@ -67,3 +68,17 @@ class LancePipelineWithLogProb(BagelPipelineWithLogProb, LancePipeline):
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
         logger.info("LancePipelineWithLogProb: SDE scheduler enabled, timestep_shift=%s", LANCE_TIMESTEP_SHIFT)
+
+
+@VllmOmniPipelineBase.register("OmniLanceForConditionalGeneration", algorithm="flow_grpo_t2v")
+class LanceVideoPipelineWithLogProb(LancePipelineWithLogProb):
+    """Text-to-video rollout for Lance.
+
+    Same pipeline, model construction and sigma schedule as the text-to-image
+    one; only the declared media stream differs.  ``LancePipeline.forward``
+    routes on ``modalities``, so this is what makes a t2v request reach
+    ``_forward_t2v`` instead of the image path.  The recipe selects it with
+    ``actor_rollout_ref.model.algorithm=flow_grpo_t2v``.
+    """
+
+    diffusion_io_spec = DiffusionIOSpec(primary=MediaSpec("video"))
