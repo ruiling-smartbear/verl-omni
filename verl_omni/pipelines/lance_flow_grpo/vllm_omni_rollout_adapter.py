@@ -94,3 +94,37 @@ class LancePipelineWithLogProb(BagelPipelineWithLogProb, LancePipeline):
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
         logger.info("LancePipelineWithLogProb: SDE scheduler enabled, timestep_shift=%s", LANCE_TIMESTEP_SHIFT)
+
+    @classmethod
+    def flowgrpo_announces_modality(cls, model_config: DiffusionModelConfig) -> bool:
+        """Lance routes on ``modalities`` on both checkpoints.
+
+        On the image checkpoint a text-to-image request and an image-edit
+        request differ only in their conditioning stream, and the pipeline
+        dispatches on ``modalities``, so the image modality has to be announced
+        even though it is the default for a single-stage engine.
+        """
+        del model_config
+        return True
+
+    @classmethod
+    def flowgrpo_media_keys(cls, model_config: DiffusionModelConfig) -> dict[str, str]:
+        """Name a video run's conditioning streams the way its node reads them.
+
+        The rollout transport only knows media modalities, so a conditioning
+        frame arrives as ``multi_modal_data["image"]``.  On a video checkpoint
+        that frame is a first frame, and ``LancePipeline.forward`` routes to
+        ``_forward_i2v`` only when it arrives as ``first_frame``: under the plain
+        key the request falls through to ``_forward_t2v`` and the reference is
+        dropped without an error.  The image checkpoint keeps the plain key,
+        which is what ``_forward_image_edit`` reads.
+
+        A reference *video* keeps its own ``video`` key, because that is both
+        what the transport names a video stream and what ``_forward_video_edit``
+        reads, so a video-edit run needs no rename here.
+        """
+        model = getattr(model_config, "local_path", None) or getattr(model_config, "path", "") or ""
+        od_config = SimpleNamespace(model=model, extra=getattr(model_config, "extra", None))
+        if LancePipeline._select_video_variant(od_config):
+            return {"image": "first_frame"}
+        return {}

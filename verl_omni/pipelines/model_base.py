@@ -14,7 +14,7 @@
 
 import logging
 from abc import ABC, abstractmethod
-from typing import Any, Optional
+from typing import Any, Mapping, Optional
 
 import torch
 from diffusers import ModelMixin, SchedulerMixin
@@ -453,6 +453,38 @@ class VllmOmniPipelineBase:
         if pipeline_cls is None:
             return None
         return f"{pipeline_cls.__module__}.{pipeline_cls.__qualname__}"
+
+    @classmethod
+    def flowgrpo_announces_modality(cls, model_config: DiffusionModelConfig) -> bool:
+        """Whether the pipeline needs the request's primary modality announced.
+
+        A pipeline that routes on ``modalities`` has to be told what the request
+        asks for.  That is implied for a multi-stage engine and for any
+        non-image stream, but on an image checkpoint a text-to-image request and
+        an image-conditioned one are otherwise indistinguishable, and the
+        conditioning would be dropped silently.
+
+        Returns:
+            ``True`` to always set ``modalities`` from the adapter's media spec.
+        """
+        del model_config
+        return False
+
+    @classmethod
+    def flowgrpo_media_keys(cls, model_config: DiffusionModelConfig) -> Mapping[str, str]:
+        """Rename rollout media streams to the keys the pipeline reads them under.
+
+        The rollout transport only knows media modalities, so a conditioning
+        stream arrives under its modality name.  A pipeline that names it for its
+        role instead - Lance's text-to-video node reads a reference frame as
+        ``first_frame`` - declares the rename here rather than in shared code.
+
+        Returns:
+            Mapping from the transport's key to the pipeline's key.  Empty when
+            the pipeline reads every stream under its modality name.
+        """
+        del model_config
+        return {}
 
     @classmethod
     def flowgrpo_io_spec(cls, model_config: DiffusionModelConfig) -> Optional[DiffusionIOSpec]:

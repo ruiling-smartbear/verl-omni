@@ -780,6 +780,155 @@ def test_diffusion_strategy_preserves_multistage_prompt_shape():
 
 
 @pytest.mark.asyncio
+def test_diffusion_strategy_applies_declared_media_keys(monkeypatch):
+    """A conditioning stream reaches the pipeline under the key it reads.
+
+    ``multi_modal_data`` is assembled from modalities, so without the adapter's
+    declaration an image-conditioned pipeline that reads its reference frame
+    under a role name would never see it - Lance's i2v node reads
+    ``first_frame`` and falls back to text-to-video otherwise.
+    """
+    pipeline_cls = SimpleNamespace(
+        diffusion_io_spec=DiffusionIOSpec(primary=MediaSpec("video")),
+        flowgrpo_media_keys=staticmethod(lambda model_config: {"image": "first_frame"}),
+    )
+    monkeypatch.setattr(
+        diffusion_strategy_module.VllmOmniPipelineBase,
+        "get_class",
+        staticmethod(lambda **kwargs: pipeline_cls),
+    )
+    server = SimpleNamespace(
+        engine=SimpleNamespace(default_sampling_params_list=["diffusion-stage"]),
+        model_config=SimpleNamespace(architecture="Architecture", algorithm="Algorithm"),
+    )
+    strategy = DiffusionStrategy(server)
+    request = OmniRolloutRequest.from_generate_kwargs(prompt_ids=[1, 2], image_data=["frame"])
+
+    prompt, _ = strategy.preprocess_input(request, {}, None)
+
+    assert prompt["multi_modal_data"] == {"first_frame": ["frame"]}
+    assert prompt["modalities"] == ["video"]
+
+
+def test_diffusion_strategy_surfaces_rl_metadata_for_the_trainer(monkeypatch):
+    """An adapter's ``rl`` metadata reaches the batch the trainer replays from.
+
+    The envelope only forwards the ``rl`` and ``prompt_embeddings`` groups, so
+    anything a trainer needs on the replay side has to travel there.  Lance's
+    edit modes put the noise block's rotary anchor in that group.
+    """
+    strategy = DiffusionStrategy(SimpleNamespace(global_steps=1))
+    monkeypatch.setattr(strategy, "_diffusion_io_spec", lambda: DiffusionIOSpec(MediaSpec("image")))
+    final_res = SimpleNamespace(
+        images=[torch.zeros(3, 4, 4, dtype=torch.uint8)],
+        trajectory_latents=None,
+        trajectory_timesteps=None,
+        trajectory_log_probs=None,
+        multimodal_output={"metadata": {"rl": {"rope_anchor": torch.tensor([1330.0])}}},
+        request_output=None,
+    )
+
+    processed = strategy.process_output(final_res, None, {"output_type": "pt"})
+
+    assert float(processed.extra_fields["rope_anchor"]) == 1330.0
+
+
+def test_diffusion_strategy_unbatches_row_shaped_rl_fields(monkeypatch):
+    """An ``rl`` field arrives one sample deep and is unbatched for the trainer.
+
+    The rollout transport carries one sample per request, so a field like the
+    reference rows an edit replay needs must be shaped ``(1, L, D)``; a bare
+    ``(L, D)`` would be unbatched into a single row and reach the trainer as
+    garbage.  The trainer then sees ``(L, D)`` again.
+    """
+    strategy = DiffusionStrategy(SimpleNamespace(global_steps=1))
+    monkeypatch.setattr(strategy, "_diffusion_io_spec", lambda: DiffusionIOSpec(MediaSpec("image")))
+    ref_rows = torch.zeros(1, 6, 4)
+    final_res = SimpleNamespace(
+        images=[torch.zeros(3, 4, 4, dtype=torch.uint8)],
+        trajectory_latents=None,
+        trajectory_timesteps=None,
+        trajectory_log_probs=None,
+        multimodal_output={"metadata": {"rl": {"condition_ref_rows": ref_rows}}},
+        request_output=None,
+    )
+
+    processed = strategy.process_output(final_res, None, {"output_type": "pt"})
+
+    assert processed.extra_fields["condition_ref_rows"].shape == (6, 4)
+
+
+def test_diffusion_strategy_announces_modality_when_the_adapter_routes_on_it(monkeypatch):
+    """An image-conditioned pipeline that routes on ``modalities`` must be told.
+
+    On an image checkpoint a text-to-image request and an image-edit request
+    differ only in their conditioning stream, so without the announcement the
+    pipeline's dispatch drops the reference and silently generates text-to-image.
+    """
+    pipeline_cls = SimpleNamespace(
+        diffusion_io_spec=DiffusionIOSpec(primary=MediaSpec("image")),
+        flowgrpo_announces_modality=staticmethod(lambda model_config: True),
+    )
+    monkeypatch.setattr(
+        diffusion_strategy_module.VllmOmniPipelineBase,
+        "get_class",
+        staticmethod(lambda **kwargs: pipeline_cls),
+    )
+    server = SimpleNamespace(
+        engine=SimpleNamespace(default_sampling_params_list=["diffusion-stage"]),
+        model_config=SimpleNamespace(architecture="Architecture", algorithm="Algorithm"),
+    )
+    strategy = DiffusionStrategy(server)
+    request = OmniRolloutRequest.from_generate_kwargs(prompt_ids=[1, 2], image_data=["frame"])
+
+    prompt, _ = strategy.preprocess_input(request, {}, None)
+
+    assert prompt["modalities"] == ["image"]
+
+
+def test_diffusion_strategy_leaves_single_stage_image_requests_alone(monkeypatch):
+    """An adapter that does not route on ``modalities`` keeps the old request."""
+    pipeline_cls = SimpleNamespace(diffusion_io_spec=DiffusionIOSpec(primary=MediaSpec("image")))
+    monkeypatch.setattr(
+        diffusion_strategy_module.VllmOmniPipelineBase,
+        "get_class",
+        staticmethod(lambda **kwargs: pipeline_cls),
+    )
+    server = SimpleNamespace(
+        engine=SimpleNamespace(default_sampling_params_list=["diffusion-stage"]),
+        model_config=SimpleNamespace(architecture="Architecture", algorithm="Algorithm"),
+    )
+    strategy = DiffusionStrategy(server)
+    request = OmniRolloutRequest.from_generate_kwargs(prompt_ids=[1, 2])
+
+    prompt, _ = strategy.preprocess_input(request, {}, None)
+
+    assert "modalities" not in prompt
+
+
+def test_diffusion_strategy_rejects_colliding_media_keys(monkeypatch):
+    """Two streams must not be renamed onto the same key silently."""
+    pipeline_cls = SimpleNamespace(
+        diffusion_io_spec=DiffusionIOSpec(primary=MediaSpec("video")),
+        flowgrpo_media_keys=staticmethod(lambda model_config: {"image": "video"}),
+    )
+    monkeypatch.setattr(
+        diffusion_strategy_module.VllmOmniPipelineBase,
+        "get_class",
+        staticmethod(lambda **kwargs: pipeline_cls),
+    )
+    server = SimpleNamespace(
+        engine=SimpleNamespace(default_sampling_params_list=["diffusion-stage"]),
+        model_config=SimpleNamespace(architecture="Architecture", algorithm="Algorithm"),
+    )
+    strategy = DiffusionStrategy(server)
+    request = OmniRolloutRequest.from_generate_kwargs(prompt_ids=[1, 2], image_data=["frame"], video_data=["clip"])
+
+    with pytest.raises(ValueError, match="collide after the adapter's rename"):
+        strategy.preprocess_input(request, {}, None)
+
+
+@pytest.mark.asyncio
 async def test_diffusion_strategy_rejects_nonzero_priority():
     strategy = DiffusionStrategy(SimpleNamespace())
 

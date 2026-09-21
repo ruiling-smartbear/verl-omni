@@ -83,6 +83,103 @@ class LanceDiffusion(BagelDiffusion):
         setup_lance_sigmas(scheduler, model_config.pipeline.num_inference_steps, device=device)
 
     @classmethod
+    def prepare_model_inputs(
+        cls,
+        module,
+        model_config: DiffusionModelConfig,
+        latents: torch.Tensor,
+        timesteps: torch.Tensor,
+        prompt_embeds: torch.Tensor,
+        prompt_embeds_mask: torch.Tensor,
+        negative_prompt_embeds: torch.Tensor,
+        negative_prompt_embeds_mask: torch.Tensor,
+        micro_batch,
+        step: int,
+    ) -> tuple[dict, dict]:
+        """Pass the rollout's rotary anchor for the latent block into the replay.
+
+        ``LancePipeline._forward_image_edit`` and its video sibling anchor the
+        noise block at the reference's own positions rather than after the text,
+        so a replay that assumed the text length would rotate the whole block by
+        the length of the reference context.  The pipeline exports the value it
+        used and the trainer replays on that basis.  A run without the field
+        (text-to-image, text-to-video) is unaffected.
+        """
+        model_inputs, negative_model_inputs = super().prepare_model_inputs(
+            module,
+            model_config,
+            latents,
+            timesteps,
+            prompt_embeds,
+            prompt_embeds_mask,
+            negative_prompt_embeds,
+            negative_prompt_embeds_mask,
+            micro_batch,
+            step,
+        )
+        rope_anchor = micro_batch.get("rope_anchor") if micro_batch is not None else None
+        if rope_anchor is not None:
+            model_inputs["position_anchor"] = rope_anchor
+            negative_model_inputs["position_anchor"] = rope_anchor
+        cls._pin_first_frame(model_inputs, negative_model_inputs, micro_batch)
+        cls._add_edit_condition(model_inputs, negative_model_inputs, micro_batch)
+        return model_inputs, negative_model_inputs
+
+    @classmethod
+    def _pin_first_frame(cls, model_inputs, negative_model_inputs, micro_batch) -> None:
+        """Hold the image-to-video pin's tokens at ``timestep = 0`` in the replay.
+
+        The rollout pins the first latent frame: the sampler applies zero sigma
+        there and restores the pinned values after every step, so the rollout's
+        velocity at those tokens is the one at ``t = 0``.  A replay that used the
+        step's sigma everywhere would score a different velocity for a seventh of
+        the block - which is exactly where image-to-video's log-prob difference
+        was an order of magnitude looser than the two edit modes.  The pinned
+        values themselves need no export: the recorded latents already hold them.
+        """
+        pinned = micro_batch.get("frame_condition_token_indexes") if micro_batch is not None else None
+        if pinned is None:
+            return
+        indexes = pinned.reshape(-1).to(model_inputs["hidden_states"].device, torch.long)
+        latent_tokens = model_inputs["hidden_states"].shape[1]
+        for inputs in (model_inputs, negative_model_inputs):
+            timestep = inputs["timestep"]
+            if timestep.ndim == 1:
+                timestep = timestep[:, None].expand(-1, latent_tokens)
+            inputs["timestep"] = timestep.clone().index_fill(-1, indexes, 0.0)
+
+    #: Rollout-exported fields an image-edit trajectory replays with.
+    _CONDITION_KEYS = (
+        "condition_prefix_ids",
+        "condition_prefix_positions",
+        "condition_ref_rows",
+        "condition_ref_positions",
+        "condition_ref_is_gen",
+        "condition_latent_positions",
+        "condition_latent_grid",
+    )
+
+    @classmethod
+    def _add_edit_condition(cls, model_inputs, negative_model_inputs, micro_batch) -> None:
+        """Attach the exported reference rows, one tail per branch.
+
+        The two CFG branches share everything except the tail: the conditional
+        branch carries the instruction, the unconditional one is the same
+        sequence with that segment removed, exactly as the pipeline prefilled
+        them.
+        """
+        if micro_batch is None or micro_batch.get("condition_ref_rows") is None:
+            return
+        shared = {key: micro_batch[key] for key in cls._CONDITION_KEYS if micro_batch.get(key) is not None}
+        for inputs, suffix in ((model_inputs, "gen"), (negative_model_inputs, "cfg")):
+            inputs["condition"] = {
+                **shared,
+                "condition_tail_ids": micro_batch[f"condition_{suffix}_tail_ids"],
+                "condition_tail_positions": micro_batch[f"condition_{suffix}_tail_positions"],
+                "condition_tail_mask": micro_batch[f"condition_{suffix}_tail_mask"],
+            }
+
+    @classmethod
     def _get_latent_pos_ids(cls, model_config: DiffusionModelConfig, module, device) -> torch.Tensor:
         """BAGEL's grid, extended with a temporal axis for video requests.
 

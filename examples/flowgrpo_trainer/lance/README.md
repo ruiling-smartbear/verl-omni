@@ -9,9 +9,33 @@ vllm-omni's `LancePipeline` inherits `BagelPipeline` and overrides only model
 construction, so the verl-omni side reuses BAGEL's MoT training module and
 adapters and overrides only what the checkpoint changes.
 
-This milestone covers **`t2i` RL with LoRA on the generation expert**.  The
-video path (`t2v`, `i2v`, editing) is tracked separately; see
-[RFC #222](https://github.com/verl-project/verl-omni/issues/222).
+This directory covers the image path (`t2i` RL with LoRA on the generation
+expert) and the video and editing paths (`t2v`, `i2v`, `image_edit`,
+`video_edit`).  See [RFC #222](https://github.com/verl-project/verl-omni/issues/222).
+
+| Recipe | Mode | Reward |
+| --- | --- | --- |
+| `run_lance_pickscore_lora.sh` | `t2i` | PickScore |
+| `run_lance_t2v_imagebind_lora.sh` | `t2v` | ImageBind |
+| `run_lance_i2v_imagebind_lora.sh` | `i2v` (reference frame pinned as frame 0) | ImageBind |
+| `run_lance_image_edit_pickscore_lora.sh` | `image_edit` (reference image) | PickScore |
+| `run_lance_video_edit_imagebind_lora.sh` | `video_edit` (reference video) | ImageBind |
+
+Each has a `*_smoke.sh` that runs two steps at the same resolution and schedule.
+The three conditioned recipes need the rollout-side changes in
+`vllm-project/vllm-omni#7858` and `#7907` (or the fork branch
+`ruiling-smartbear/vllm-omni:fix/lance-conditioned-replay-export`, which carries
+both): without them text-to-video and image-to-video stop at
+`KeyError: 'all_timesteps'`, and image edit runs but replays without its
+reference.  `video_edit` takes its reference as a **path** that the rollout
+workers can read, because the pipeline decodes it to reuse upstream Lance's own
+bucket resize and frame sampler.  Two consequences of the generated shape
+following the reference: the recipe's `pipeline.height` / `width` / `num_frames`
+do not drive this mode, and **every sample in a rollout batch must share one
+reference shape** - a batch that mixes shapes cannot be collated, because the
+latent blocks differ in length (`Sizes of tensors must match ... Expected size
+640 but got size 480`), so a dataset of mixed shapes needs shape bucketing
+upstream.
 
 ## What differs from BAGEL
 
@@ -147,10 +171,9 @@ at 15 steps) puts every timestep into the comparison.
 
 ## Not covered here
 
-- `t2v` / `i2v` / image and video editing: these need the 3-D latent position
-  embedding and the temporal mRoPE axis, plus the Wan2.2 multi-frame decode in
-  the reward path.  The 2-D positions this adds are the image case of the same
-  construction, so the video case extends `build_position_ids` rather than
-  replacing it.
 - `x2t_image` / `x2t_video`: autoregressive token generation, so they belong to
   the AR/VLM RL path rather than the diffusion FlowGRPO adapter.
+- Masking an `i2v` rollout's pinned first frame out of the objective.  The pin is
+  replayed faithfully (its tokens keep `timestep = 0`), so its ratio is 1 and it
+  contributes no gradient; excluding it needs a per-token loss mask the engine
+  does not have.

@@ -360,6 +360,172 @@ def test_lance_rollout_declares_video_for_the_video_checkpoint_only():
     assert LancePipelineWithLogProb.flowgrpo_io_spec(unresolved).primary.modality == "video"
 
 
+def test_lance_video_request_hands_the_reference_frame_to_i2v():
+    """A video run's reference frame has to arrive as ``first_frame``.
+
+    ``LancePipeline.forward`` sends a video request with ``first_frame`` to
+    ``_forward_i2v`` and one with no conditioning at all to ``_forward_t2v``, so
+    a frame left under the transport's plain ``image`` key would be dropped and
+    the run would silently train text-to-video instead.
+    """
+    from verl_omni.pipelines.lance_flow_grpo.vllm_omni_rollout_adapter import LancePipelineWithLogProb
+
+    bundle = "/models/bytedance-research/Lance"
+
+    assert LancePipelineWithLogProb.flowgrpo_media_keys(SimpleNamespace(local_path=f"{bundle}/Lance_3B_Video")) == {
+        "image": "first_frame"
+    }
+    # ``path`` is the fallback before ``local_path`` has been resolved.
+    unresolved = SimpleNamespace(path=f"{bundle}/Lance_3B_Video/")
+    assert LancePipelineWithLogProb.flowgrpo_media_keys(unresolved) == {"image": "first_frame"}
+    # The image checkpoint edits from the plain key, so nothing is renamed.
+    assert LancePipelineWithLogProb.flowgrpo_media_keys(SimpleNamespace(local_path=f"{bundle}/Lance_3B")) == {}
+    # Both checkpoints route on modalities, which is what tells the pipeline an
+    # image_edit request apart from a text-to-image one.
+    assert LancePipelineWithLogProb.flowgrpo_announces_modality(SimpleNamespace()) is True
+
+    # The base declarations are empty, so every other adapter is unaffected.
+    from verl_omni.pipelines.model_base import VllmOmniPipelineBase
+
+    assert VllmOmniPipelineBase.flowgrpo_media_keys(SimpleNamespace()) == {}
+    assert VllmOmniPipelineBase.flowgrpo_announces_modality(SimpleNamespace()) is False
+
+
+def test_lance_video_routing_picks_i2v_only_for_a_first_frame():
+    """The routing the reference-frame rename exists for, asserted directly.
+
+    ``LancePipeline.forward`` dispatches a video request to ``_forward_i2v``
+    only when the frame sits under ``first_frame``; the plain ``image`` key the
+    rollout transport produces falls through to text-to-video and the reference
+    is dropped without an error.  That is why the adapter renames it.
+    """
+    from vllm_omni.diffusion.models.lance.pipeline_lance import LancePipeline
+
+    calls: list[str] = []
+    stub = SimpleNamespace(
+        _forward_i2v=lambda req: calls.append("i2v"),
+        _forward_video_edit=lambda req: calls.append("video_edit"),
+        _forward_t2v=lambda req: calls.append("t2v"),
+    )
+
+    def node(modalities: list[str], multi_modal_data: dict) -> str:
+        calls.clear()
+        request = SimpleNamespace(prompts=[{"modalities": modalities, "multi_modal_data": multi_modal_data}])
+        LancePipeline.forward(stub, request)
+        return calls[-1]
+
+    frame = object()
+    assert node(["video"], {"first_frame": frame}) == "i2v"
+    assert node(["video"], {"video": "clip.mp4"}) == "video_edit"
+    assert node(["video"], {}) == "t2v"
+    # The silent fallback the rename removes: a frame under the transport's own
+    # key reaches text-to-video instead of image-to-video.
+    assert node(["video"], {"image": frame}) == "t2v"
+
+
+def _synthetic_edit_condition(
+    batch: int = 1, prefix: int = 3, ref: int = 5, tail: int = 4, latent: int = 4, hidden: int = 64
+):
+    """A condition bundle shaped like the rollout's image-edit export."""
+    return {
+        "condition_prefix_ids": torch.randint(1, 190, (batch, prefix)),
+        "condition_prefix_positions": torch.arange(prefix).expand(batch, -1),
+        "condition_ref_rows": torch.randn(batch, ref, hidden),
+        "condition_ref_positions": torch.arange(prefix, prefix + ref).expand(3, -1).unsqueeze(0).expand(batch, -1, -1),
+        "condition_ref_is_gen": torch.cat(
+            [torch.zeros(batch, ref - 2, dtype=torch.bool), torch.ones(batch, 2, dtype=torch.bool)], dim=1
+        ),
+        "condition_tail_ids": torch.randint(1, 190, (batch, tail)),
+        "condition_tail_positions": torch.arange(prefix + ref, prefix + ref + tail).expand(batch, -1),
+        "condition_tail_mask": torch.ones(batch, tail, dtype=torch.bool),
+        "condition_latent_positions": torch.zeros(batch, 3, latent + 2, dtype=torch.long),
+        "condition_latent_grid": torch.arange(latent).expand(batch, -1),
+    }
+
+
+def test_lance_replays_an_edit_condition_from_the_rollout():
+    """Exported reference rows, their routing and the latent basis all matter.
+
+    ``_forward_image_edit`` prefills the reference through the ViT and the VAE,
+    which this model cannot do; the rows and the positions they sat at travel
+    with the trajectory, and the replay has to use them rather than rebuild a
+    context of its own.
+    """
+    config = _tiny_config()
+    config.max_latent_size = 8
+    model = LanceForTraining(config).float()
+    latent = torch.randn(1, 4, config.patch_latent_dim)
+    timestep = torch.tensor([0.6])
+    condition = _synthetic_edit_condition()
+
+    (velocity,) = model(hidden_states=latent, timestep=timestep, condition=condition)
+    assert velocity.shape == (1, 4, config.patch_latent_dim)
+    assert torch.isfinite(velocity).all()
+
+    # The reference rows are part of the context, not decoration.
+    perturbed = {**condition, "condition_ref_rows": condition["condition_ref_rows"] + 1.0}
+    (other,) = model(hidden_states=latent, timestep=timestep, condition=perturbed)
+    assert not torch.allclose(velocity, other)
+
+    # The latent block's rotary basis is the rollout's, used verbatim.
+    shifted = {**condition, "condition_latent_positions": condition["condition_latent_positions"] + 5}
+    (moved,) = model(hidden_states=latent, timestep=timestep, condition=shifted)
+    assert not torch.allclose(velocity, moved)
+
+
+def test_lance_edit_condition_ignores_padded_tail_slots():
+    """Padding only keeps the batch rectangular, so it must not be attended to."""
+    config = _tiny_config()
+    config.max_latent_size = 8
+    model = LanceForTraining(config).float()
+    latent = torch.randn(1, 4, config.patch_latent_dim)
+    timestep = torch.tensor([0.6])
+    condition = _synthetic_edit_condition()
+    condition["condition_tail_mask"] = torch.tensor([[True, True, False, False]])
+    condition["condition_tail_positions"] = condition["condition_tail_positions"].clone()
+    condition["condition_tail_positions"][0, 2:] = 0
+
+    (velocity,) = model(hidden_states=latent, timestep=timestep, condition=condition)
+
+    noisy = {**condition, "condition_tail_ids": condition["condition_tail_ids"].clone()}
+    noisy["condition_tail_ids"][0, 2:] = 190  # outside the real instruction
+    (other,) = model(hidden_states=latent, timestep=timestep, condition=noisy)
+
+    assert torch.allclose(velocity, other), "masked tail slots changed the prediction"
+
+
+def test_lance_positions_honor_the_rollouts_anchor():
+    """The latent block sits where the rollout put it, not after the text.
+
+    Lance's edit modes anchor the noise block at the reference VAE block's
+    positions, which is what lets the model map noise tokens onto reference
+    tokens; a replay that assumed the text length would rotate the whole block.
+    """
+    config = _tiny_config()
+    config.max_latent_size = 64
+    model = LanceForTraining(config)
+    latent_pos_ids = get_flattened_position_ids(_IMAGE_HW, _IMAGE_HW, _LATENT_DOWNSAMPLE, 64)
+    latent_pos_ids = latent_pos_ids.unsqueeze(0).expand(2, -1)
+    num_text = 5
+    anchor = torch.tensor([64, 96])
+
+    default = model.build_position_ids(2, num_text, latent_pos_ids.shape[1], latent_pos_ids, torch.device("cpu"))
+    shifted = model.build_position_ids(
+        2,
+        num_text,
+        latent_pos_ids.shape[1],
+        latent_pos_ids,
+        torch.device("cpu"),
+        text_attention_mask=torch.ones(2, num_text, dtype=torch.bool),
+        position_anchor=anchor,
+    )
+
+    # The text rows are untouched; every block row moves by the anchor delta.
+    assert torch.equal(default[:, :, :num_text], shifted[:, :, :num_text])
+    delta = (anchor - num_text).reshape(2, 1, 1)
+    assert torch.equal(shifted[:, :, num_text:], default[:, :, num_text:] + delta)
+
+
 def test_lance_video_position_table_is_the_rollouts_table():
     """The 3-D table must be built exactly as vllm-omni builds it.
 
