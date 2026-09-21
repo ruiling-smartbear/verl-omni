@@ -29,7 +29,13 @@ both): without them text-to-video and image-to-video stop at
 `KeyError: 'all_timesteps'`, and image edit runs but replays without its
 reference.  `video_edit` takes its reference as a **path** that the rollout
 workers can read, because the pipeline decodes it to reuse upstream Lance's own
-bucket resize and frame sampler.
+bucket resize and frame sampler.  Two consequences of the generated shape
+following the reference: the recipe's `pipeline.height` / `width` / `num_frames`
+do not drive this mode, and **every sample in a rollout batch must share one
+reference shape** - a batch that mixes shapes cannot be collated, because the
+latent blocks differ in length (`Sizes of tensors must match ... Expected size
+640 but got size 480`), so a dataset of mixed shapes needs shape bucketing
+upstream.
 
 ## What differs from BAGEL
 
