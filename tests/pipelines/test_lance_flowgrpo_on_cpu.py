@@ -38,9 +38,11 @@ from verl_omni.pipelines.bagel_flow_grpo.common import (
 )
 from verl_omni.pipelines.lance_flow_grpo.common import (
     LANCE_MROPE_SECTION,
+    LANCE_TEMPORAL_ROPE_SCALE,
     LANCE_TIMESTEP_SHIFT,
     setup_lance_sigmas,
 )
+from verl_omni.pipelines.lance_flow_grpo.diffusers_training_adapter import LanceDiffusion
 from verl_omni.pipelines.lance_flow_grpo.lance_model import (
     LanceForTraining,
     LanceRotaryEmbedding,
@@ -89,14 +91,26 @@ def _tiny_config() -> LanceTrainingConfig:
     )
 
 
-def _write_tiny_checkpoint(root: str, *, subdir: str | None = "Lance_3B") -> str:
-    """Write a tiny Lance-layout checkpoint and return the bundle root."""
+def _write_tiny_checkpoint(
+    root: str,
+    *,
+    subdir: str | None = "Lance_3B",
+    max_latent_size: int = 8,
+    num_frames: int = 1,
+) -> str:
+    """Write a tiny Lance-layout checkpoint and return the bundle root.
+
+    ``max_latent_size`` and ``num_frames`` shape ``latent_pos_embed``, which is
+    how a real video checkpoint differs from the image one.
+    """
     ckpt_dir = os.path.join(root, subdir) if subdir else root
     os.makedirs(ckpt_dir, exist_ok=True)
     with open(os.path.join(ckpt_dir, "llm_config.json"), "w") as f:
         json.dump(TINY_LLM_CONFIG, f)
 
     config = _tiny_config()
+    config.max_latent_size = max_latent_size
+    config.max_num_frames = num_frames
     reference = LanceForTraining(config)
     state_dict = {}
     for name, tensor in reference.state_dict().items():
@@ -258,6 +272,121 @@ def test_trainer_positions_are_not_bagels_scalar():
     assert block[1].unique().numel() > 1, "the h axis must vary across rows"
     assert block[2].unique().numel() > 1, "the w axis must vary across columns"
     assert not torch.equal(block[1], block[2]), "h and w must not collapse onto each other"
+
+
+#: 25 pixel frames at the 4x temporal stride: 7 latent frames.
+_VIDEO_FRAMES = 25
+_VIDEO_LATENT_FRAMES = (_VIDEO_FRAMES - 1) // 4 + 1
+
+
+def _rollout_video_block_positions(video_shape: tuple[int, int, int], anchor: int) -> torch.Tensor:
+    """The 3-D positions ``LanceBagel`` feeds for a video generation block.
+
+    Calls the rollout's own builder, like the image helper above, so the trainer
+    cannot drift from the rotary basis the trajectory was produced under.
+    """
+    from vllm_omni.diffusion.models.lance.lance_transformer import LanceBagel
+
+    stub = SimpleNamespace(
+        latent_downsample=_LATENT_DOWNSAMPLE,
+        config=SimpleNamespace(vae_config=SimpleNamespace(downsample_temporal=4)),
+    )
+    return LanceBagel._per_token_mrope_for_video_latent(stub, [video_shape], [anchor])
+
+
+def test_trainer_video_positions_are_the_ones_the_rollout_feeds():
+    """Video adds a temporal axis, amplified the way the rollout amplifies it.
+
+    ``build_position_ids`` has to place ``(P + 1 + t * t_scale, P + 1 + h, P + 1 + w)``
+    for the latent block so the trainer replays on the rollout's rotary basis.
+    """
+    num_text = 7
+    config = _tiny_config()
+    config.max_latent_size = 64  # the released grid, so the ids match the rollout
+    model = LanceForTraining(config)
+    latent_pos_ids = get_flattened_position_ids(
+        _IMAGE_HW, _IMAGE_HW, _LATENT_DOWNSAMPLE, 64, num_frames=_VIDEO_LATENT_FRAMES
+    )
+    assert latent_pos_ids.numel() == _VIDEO_LATENT_FRAMES * 32 * 32
+
+    positions = model.build_position_ids(1, num_text, latent_pos_ids.numel(), latent_pos_ids, torch.device("cpu"))
+    expected = _rollout_video_block_positions((_VIDEO_FRAMES, _IMAGE_HW, _IMAGE_HW), num_text)
+    assert torch.equal(positions[0, :, num_text:], expected)
+
+    # The temporal axis must actually be present, and carry the amplification.
+    # The block is the start marker, the latent tokens and the end marker.
+    latent = positions[0, :, num_text + 1 : -1]
+    assert latent[0].unique().numel() == _VIDEO_LATENT_FRAMES
+    assert int(latent[0].max()) - int(latent[0].min()) == (_VIDEO_LATENT_FRAMES - 1) * LANCE_TEMPORAL_ROPE_SCALE
+
+
+def test_lance_adapter_asks_for_a_temporal_axis_only_on_video():
+    """The adapter derives the grid; one frame must stay BAGEL's image grid."""
+    config = _tiny_config()
+    config.max_latent_size = 64
+    module = SimpleNamespace(config=config)
+    model_config = SimpleNamespace(pipeline=SimpleNamespace(height=_IMAGE_HW, width=_IMAGE_HW, num_frames=1))
+
+    image_ids = LanceDiffusion._get_latent_pos_ids(model_config, module, "cpu")
+    assert torch.equal(image_ids, get_flattened_position_ids(_IMAGE_HW, _IMAGE_HW, _LATENT_DOWNSAMPLE, 64))
+
+    model_config.pipeline.num_frames = _VIDEO_FRAMES
+    video_ids = LanceDiffusion._get_latent_pos_ids(model_config, module, "cpu")
+    assert video_ids.numel() == _VIDEO_LATENT_FRAMES * 32 * 32
+    assert int(video_ids.max()) == (_VIDEO_LATENT_FRAMES - 1) * 64 * 64 + 31 * 64 + 31
+
+
+def test_lance_rollout_declares_video_for_the_video_checkpoint_only():
+    """The rollout stream follows the checkpoint, as it does inside vllm-omni.
+
+    ``LancePipeline.forward`` only reaches ``_forward_t2v`` for a request whose
+    ``modalities`` carries ``video``, and the strategy builds that entry from the
+    adapter's spec.  Both Lance checkpoints share one architecture, so the spec
+    has to be resolved from the path the run was pointed at.
+    """
+    from verl_omni.pipelines.lance_flow_grpo.vllm_omni_rollout_adapter import LancePipelineWithLogProb
+
+    bundle = "/models/bytedance-research/Lance"
+
+    def modality(path: str) -> str:
+        return LancePipelineWithLogProb.flowgrpo_io_spec(SimpleNamespace(local_path=path)).primary.modality
+
+    assert modality(f"{bundle}/Lance_3B") == "image"
+    assert modality(f"{bundle}/Lance_3B_Video") == "video"
+    # A trailing separator must not hide the variant, as in vllm-omni.
+    assert modality(f"{bundle}/Lance_3B_Video/") == "video"
+    # ``path`` is the fallback before ``local_path`` has been resolved.
+    unresolved = SimpleNamespace(path=f"{bundle}/Lance_3B_Video")
+    assert LancePipelineWithLogProb.flowgrpo_io_spec(unresolved).primary.modality == "video"
+
+
+def test_lance_video_position_table_is_the_rollouts_table():
+    """The 3-D table must be built exactly as vllm-omni builds it.
+
+    Both sides index the same ``t * side**2 + h * side + w`` rows and the
+    checkpoint replaces the values at load time, so the shape and the
+    ``(t, h, w)`` dimension split are what have to agree.
+    """
+    from vllm_omni.diffusion.models.lance.lance_transformer import LancePositionEmbedding3D as RolloutTable
+
+    from verl_omni.pipelines.lance_flow_grpo.lance_model import LancePositionEmbedding3D as TrainerTable
+
+    rollout_table = RolloutTable(3, 4, 48)
+    trainer_table = TrainerTable(3, 4, 48)
+    assert trainer_table.pos_embed.shape == rollout_table.pos_embed.shape == (3 * 4 * 4, 48)
+    assert torch.equal(trainer_table.pos_embed, rollout_table.pos_embed)
+
+
+def test_video_checkpoint_sizes_the_position_table_from_the_checkpoint(tmp_path):
+    """A multi-frame table must load into a model built for that many frames.
+
+    ``Lance_3B_Video`` stores ``31 * 64 * 64`` rows where the image table has
+    ``64 * 64``; a trainer that always builds the image table fails the load
+    with a size mismatch.
+    """
+    ckpt = _write_tiny_checkpoint(str(tmp_path), max_latent_size=64, num_frames=3)
+    model = LanceForTraining.from_pretrained(ckpt)
+    assert model.latent_pos_embed.pos_embed.shape == (3 * 64 * 64, TINY_LLM_CONFIG["hidden_size"])
 
 
 def test_trainer_rotary_is_the_rollouts_rotary():
@@ -469,7 +598,10 @@ def test_batched_forward_and_gradients_match_individual_samples(short_length, ch
         text_attention_mask=mask,
         latent_pos_ids=grids,
     )[0]
-    torch.testing.assert_close(batched, torch.cat(individual), rtol=1e-5, atol=1e-6)
+    expected_all = torch.cat(individual)
+    error = (batched - expected_all).norm()
+    tolerance = torch.finfo(torch.bfloat16).eps * expected_all.norm()
+    assert error <= tolerance, f"forward error {error.item()} > {tolerance.item()}"
     batched.square().sum().backward()
     for name, parameter in model.named_parameters():
         expected = expected_grads[name]
@@ -481,6 +613,30 @@ def test_batched_forward_and_gradients_match_individual_samples(short_length, ch
             error = (parameter.grad - expected).norm()
             tolerance = torch.finfo(torch.bfloat16).eps * expected.norm() + 1e-5
             assert error <= tolerance, f"{name}: gradient error {error.item()} > {tolerance.item()}"
+
+    # The padded-batch paths above are compared under a bf16 bound because the
+    # single-sample and batched calls reach different SDPA kernels.  The two
+    # claims the padding has to satisfy exactly are checked without any bound:
+    # a sample's text masked rather than truncated, and a different neighbour.
+    alone_masked = model(
+        hidden_states=latents[:1],
+        timestep=timesteps[:1],
+        text_token_ids=tokens[:1],
+        text_attention_mask=mask[:1],
+        latent_pos_ids=grids[:1],
+    )[0]
+    assert torch.equal(alone_masked, individual[0]), "masking padding must equal truncating it"
+
+    neighbour_tokens = (tokens[1:2] + 1) % (config.vocab_size - 1) + 1
+    neighbour_grids = torch.tensor([[0, 1, 4, 5]])
+    swapped = model(
+        hidden_states=latents,
+        timestep=timesteps,
+        text_token_ids=torch.cat([tokens[:1], neighbour_tokens]),
+        text_attention_mask=mask,
+        latent_pos_ids=torch.cat([grids[:1], neighbour_grids]),
+    )[0]
+    assert torch.equal(swapped[:1], batched[:1]), "another sample must not change this one"
 
 
 def test_forward_returns_velocity_shaped_like_the_latent():

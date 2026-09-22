@@ -50,20 +50,25 @@ import os
 from collections.abc import Sequence
 from dataclasses import dataclass
 
+import numpy as np
 import torch
+import torch.nn as nn
 from torch import Tensor
 
 from verl_omni.pipelines.bagel_flow_grpo.bagel_model import (
     BagelForTraining,
     BagelTrainingConfig,
     RotaryEmbedding,
+    _get_1d_sincos_pos_embed_from_grid,
 )
 
 from .common import (
     LANCE_LATENT_PATCH_SIZE,
     LANCE_MAX_LATENT_SIZE,
     LANCE_MROPE_SECTION,
+    LANCE_TEMPORAL_ROPE_SCALE,
     LANCE_VAE_DOWNSAMPLE_SPATIAL,
+    LANCE_VAE_DOWNSAMPLE_TEMPORAL,
     LANCE_VAE_Z_CHANNELS,
 )
 
@@ -90,8 +95,14 @@ class LanceTrainingConfig(BagelTrainingConfig):
     hidden_size: int = 2048
     latent_patch_size: int = LANCE_LATENT_PATCH_SIZE
     max_latent_size: int = LANCE_MAX_LATENT_SIZE
+    #: Latent frames covered by ``latent_pos_embed``.  One frame is the image
+    #: table; Lance_3B_Video ships a 3-D table of 31.  ``from_pretrained`` takes
+    #: the value from the checkpoint, so a caller does not set this by hand.
+    max_num_frames: int = 1
     latent_channel: int = LANCE_VAE_Z_CHANNELS
     vae_downsample: int = LANCE_VAE_DOWNSAMPLE_SPATIAL
+    #: Video VAE temporal stride; ``latent_frames = (num_frames - 1) // this + 1``.
+    vae_downsample_temporal: int = LANCE_VAE_DOWNSAMPLE_TEMPORAL
     #: Head-dimension split across the (t, h, w) rotary axes.  Read from
     #: ``rope_scaling`` when the checkpoint carries it, so the trainer uses
     #: the split the rollout configures rather than a copy of it.
@@ -297,6 +308,48 @@ class LanceRotaryEmbedding(RotaryEmbedding):
         return cos, sin
 
 
+def get_3d_sincos_pos_embed(embed_dim: int, t: int, h: int, w: int) -> np.ndarray:
+    """3-D sin-cos positional embedding over ``(t, h, w)``.
+
+    The dimension split matches vllm-omni's
+    ``lance_transformer.get_3d_sincos_pos_embed`` and upstream Lance
+    ``modeling/lance/modeling_utils.py``; the checkpoint supplies the values, so
+    this only has to build the table at the shape the checkpoint uses.
+    """
+    tt, hh, ww = np.meshgrid(
+        np.arange(t, dtype=np.float32),
+        np.arange(h, dtype=np.float32),
+        np.arange(w, dtype=np.float32),
+        indexing="ij",
+    )
+    d = embed_dim // 3
+    d = d if d % 2 == 0 else d - 1
+    emb_t = _get_1d_sincos_pos_embed_from_grid(d, tt)
+    emb_h = _get_1d_sincos_pos_embed_from_grid(d, hh)
+    emb_w = _get_1d_sincos_pos_embed_from_grid(embed_dim - 2 * d, ww)
+    return np.concatenate([emb_t, emb_h, emb_w], axis=1)
+
+
+class LancePositionEmbedding3D(nn.Module):
+    """Frozen 3-D latent position embedding, matching the rollout's table.
+
+    BAGEL ships a 2-D table for image latents; ``Lance_3B_Video`` adds a
+    temporal axis and stores ``(max_num_frames * side**2, hidden)`` rows, which
+    the trainer indexes with the same flattened ``t * side**2 + h * side + w``
+    ids the rollout uses.  The image checkpoint's table is the ``t = 1`` case.
+    """
+
+    def __init__(self, max_num_frames: int, max_num_patch_per_side: int, hidden_size: int):
+        super().__init__()
+        n = max_num_frames * max_num_patch_per_side * max_num_patch_per_side
+        self.pos_embed = nn.Parameter(torch.zeros(n, hidden_size), requires_grad=False)
+        table = get_3d_sincos_pos_embed(hidden_size, max_num_frames, max_num_patch_per_side, max_num_patch_per_side)
+        self.pos_embed.data.copy_(torch.from_numpy(table).float())
+
+    def forward(self, position_ids: Tensor) -> Tensor:
+        return self.pos_embed[position_ids]
+
+
 class LanceForTraining(BagelForTraining):
     """Lance MoT module for FlowGRPO FSDP training.
 
@@ -306,6 +359,12 @@ class LanceForTraining(BagelForTraining):
 
     def __init__(self, config: LanceTrainingConfig):
         super().__init__(config)
+        if config.max_num_frames > 1:
+            # The base built BAGEL's image table; a video checkpoint's table
+            # covers every frame, so rebuild it at the checkpoint's row count.
+            self.latent_pos_embed = LancePositionEmbedding3D(
+                config.max_num_frames, config.max_latent_size, config.hidden_size
+            )
         # The rollout runs the generation block through Qwen2.5-VL mRoPE.  The
         # BAGEL layer builds a 1-D rotary, so swap the module per layer rather
         # than duplicate the layer class; everything else about the layer is
@@ -359,17 +418,28 @@ class LanceForTraining(BagelForTraining):
         if grid.shape != (batch, num_latent):
             raise ValueError(f"latent_pos_ids has shape {tuple(grid.shape)}, expected {(batch, num_latent)}")
         side = int(self.config.max_latent_size)
-        rows = torch.div(grid, side, rounding_mode="floor")
-        cols = grid % side
+        stride = side * side
+        frames = torch.div(grid, stride, rounding_mode="floor")
+        within = grid % stride
+        rows = torch.div(within, side, rounding_mode="floor")
+        cols = within % side
         if text_attention_mask is None:
             anchor = grid.new_full((batch, 1), num_text)
         else:
             anchor = text_attention_mask.to(device=device, dtype=torch.bool).sum(dim=-1, keepdim=True)
-        max_hw = torch.maximum(rows.amax(dim=-1, keepdim=True), cols.amax(dim=-1, keepdim=True)) + 1
+
+        # Extents and the end marker, mirroring
+        # ``LanceBagel._per_token_mrope_for_video_latent``.  A single frame leaves
+        # the temporal term at zero, so the image path is unchanged: max_thw
+        # collapses to max(h, w) and latent_t to anchor + 1.
+        t_lat = frames.amax(dim=-1, keepdim=True) + 1
+        h_lat = rows.amax(dim=-1, keepdim=True) + 1
+        w_lat = cols.amax(dim=-1, keepdim=True) + 1
+        max_thw = torch.maximum((t_lat - 1) * LANCE_TEMPORAL_ROPE_SCALE, torch.maximum(h_lat, w_lat) - 1) + 1
 
         text = torch.arange(num_text, device=device, dtype=torch.long).unsqueeze(0).expand(batch, -1)
-        end = anchor + max_hw + 1
-        latent_t = (anchor + 1).expand(-1, num_latent)
+        end = anchor + max_thw + 1
+        latent_t = anchor + 1 + frames * LANCE_TEMPORAL_ROPE_SCALE
 
         axes = [
             torch.cat([text, anchor, latent_t, end], dim=-1),
@@ -409,15 +479,32 @@ class LanceForTraining(BagelForTraining):
 
         pos_embed = mapped.get("latent_pos_embed.pos_embed")
         if pos_embed is not None:
-            grid = int(round(pos_embed.shape[0] ** 0.5))
-            if grid * grid != pos_embed.shape[0]:
-                raise ValueError(
-                    f"latent_pos_embed.pos_embed has {pos_embed.shape[0]} rows, which is not a square "
-                    "grid; this is the 3-D video table, which the image path does not support."
-                )
-            if grid != config.max_latent_size:
-                logger.info("Lance checkpoint carries max_latent_size=%d, overriding %d.", grid, config.max_latent_size)
-                config.max_latent_size = grid
+            rows = int(pos_embed.shape[0])
+            side = int(config.max_latent_size)
+            if rows % (side * side) == 0:
+                # ``(max_num_frames * side**2, hidden)``.  One frame is the image
+                # table; the video checkpoint carries 31 frames (``126976`` rows).
+                frames = rows // (side * side)
+                config.max_num_frames = frames
+                if frames > 1:
+                    logger.info(
+                        "Lance checkpoint carries a %d-frame video position table (%d rows, side %d).",
+                        frames,
+                        rows,
+                        side,
+                    )
+            else:
+                grid = int(round(rows**0.5))
+                if grid * grid != rows:
+                    raise ValueError(
+                        f"latent_pos_embed.pos_embed has {rows} rows, which is neither a square grid nor "
+                        f"a whole number of frames at max_latent_size={side}."
+                    )
+                if grid != config.max_latent_size:
+                    logger.info(
+                        "Lance checkpoint carries max_latent_size=%d, overriding %d.", grid, config.max_latent_size
+                    )
+                    config.max_latent_size = grid
 
         model = cls(config)
         model.load_state_dict(mapped, strict=True)

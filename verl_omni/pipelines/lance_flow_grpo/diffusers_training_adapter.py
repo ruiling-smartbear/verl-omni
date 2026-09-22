@@ -27,6 +27,7 @@ import logging
 
 import torch
 
+from verl_omni.pipelines.bagel_flow_grpo.bagel_model import get_flattened_position_ids
 from verl_omni.pipelines.bagel_flow_grpo.diffusers_training_adapter import BagelDiffusion
 from verl_omni.pipelines.model_base import DiffusionModelBase
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
@@ -40,7 +41,12 @@ logger = logging.getLogger(__name__)
 
 @DiffusionModelBase.register("OmniLanceForConditionalGeneration", algorithm="flow_grpo")
 class LanceDiffusion(BagelDiffusion):
-    """DiffusionModelBase wrapper for :class:`LanceForTraining`."""
+    """DiffusionModelBase wrapper for :class:`LanceForTraining`.
+
+    The image and the video checkpoint share this adapter: nothing here needs to
+    know which one is loaded, because ``_get_latent_pos_ids`` adds the temporal
+    axis whenever the request itself carries more than one frame.
+    """
 
     @classmethod
     def build_module(cls, model_config: DiffusionModelConfig, torch_dtype: torch.dtype):
@@ -75,3 +81,29 @@ class LanceDiffusion(BagelDiffusion):
             device: Device for the scheduler buffers.
         """
         setup_lance_sigmas(scheduler, model_config.pipeline.num_inference_steps, device=device)
+
+    @classmethod
+    def _get_latent_pos_ids(cls, model_config: DiffusionModelConfig, module, device) -> torch.Tensor:
+        """BAGEL's grid, extended with a temporal axis for video requests.
+
+        Frames above one add the ``t * side**2`` rows the video position table is
+        indexed with, so the trainer places the same rows
+        ``LanceBagel._per_token_mrope_for_video_latent`` places on the rollout
+        side.  A single frame is BAGEL's image grid unchanged.
+        """
+        config = module.config
+        num_frames = int(getattr(model_config.pipeline, "num_frames", 1) or 1)
+        if num_frames <= 1:
+            return super()._get_latent_pos_ids(model_config, module, device)
+        latent_ds = config.latent_patch_size * config.vae_downsample
+        img_h = min(model_config.pipeline.height // latent_ds, config.max_latent_size)
+        img_w = min(model_config.pipeline.width // latent_ds, config.max_latent_size)
+        frames = (num_frames - 1) // int(config.vae_downsample_temporal) + 1
+        pos_ids = get_flattened_position_ids(
+            img_h * latent_ds,
+            img_w * latent_ds,
+            latent_ds,
+            config.max_latent_size,
+            num_frames=frames,
+        )
+        return pos_ids.to(device)
