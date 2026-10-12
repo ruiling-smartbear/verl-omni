@@ -120,3 +120,16 @@ async def compute_score_dvreward(
         "semantic_score": semantic_score,
         "quality_score": quality_score,
     }
+
+
+async def compute_score_alphagrpo(*, extra_info: dict, **kwargs) -> dict[str, float]:
+    """Add the official single-turn thinking-tag reward to DVReward."""
+    thinking = extra_info.get("thinking_text")
+    if not isinstance(thinking, str):
+        raise ValueError("AlphaGRPO reward requires thinking_text from the rollout.")
+    result = await compute_score_dvreward(extra_info=extra_info, **kwargs)
+    format_score = float(thinking.startswith("<think>") and thinking.endswith("</think>"))
+    result["dvreward"] = result["score"]
+    result["thinking_format_score"] = format_score
+    result["score"] += format_score
+    return result
