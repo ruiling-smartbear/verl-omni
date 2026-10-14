@@ -189,6 +189,10 @@ returned as metrics. HTTP failures propagate; they are not converted into zero r
 
 ### Gotchas
 
+- The recipe requests `image_preview`; DVReward selects the named decoded image
+  using `preview_artifact`, even when the primary output is a latent. Missing,
+  latent or non-image previews fail before scoring. Direct tensor calls require
+  `extra_info["media_kind"] = "image"`.
 - Both question groups must be non-empty. This avoids assigning perfect scores
   to absent questions. Question records are scored in order, without filtering
   `is_valid`, matching the official scorer's behavior.
