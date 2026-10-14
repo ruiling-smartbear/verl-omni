@@ -189,6 +189,12 @@ class DiffusionActorConfig(BaseConfig):
         """Validate diffusion actor configuration parameters."""
         assert self.strategy != MISSING
         assert self.rollout_n != MISSING
+        if self.diffusion_loss.loss_mode == "alphagrpo" and (
+            self.rollout_correction.bypass_mode
+            or self.rollout_correction.rollout_is
+            or self.rollout_correction.rollout_rs
+        ):
+            raise ValueError("AlphaGRPO does not support rollout correction for its joint text/image objective.")
         valid_distill_modes = ["distill_kl", "distill_fm_mse"]
         if self.use_distill_loss and self.distill_loss_mode not in valid_distill_modes:
             raise ValueError(

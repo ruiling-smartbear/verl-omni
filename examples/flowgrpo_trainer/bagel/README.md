@@ -238,10 +238,12 @@ The wrapper trains both understanding and generation LoRA projections with FSDP2
 - AlphaGRPO uses the reference planning system prompt. Its three image contexts
   are system + prompt + thinking, system only, and system + prompt. Replay uses
   exact native token IDs; decoding is used only for reward scoring and logging.
-- Text likelihoods use the configured temperature before nucleus filtering,
-  matching the reference likelihood convention. Sequence ratios stay paired with
-  each sample's own advantage; broadcasting them into a cross-sample matrix would
-  cancel or mix group-relative learning signals.
+- Thinking requires `think_top_p=1`: sampling and replay use the same
+  temperature-scaled distribution. This differs from the reference's truncated
+  sampling with full-vocabulary likelihoods. Sequence ratios stay paired with
+  each sample's own advantage.
+- Rollout correction is unsupported for this joint objective and is rejected.
+  Image-step correction weights cannot be reused as text importance weights.
 - Only sampled thinking actions enter the text loss. A forced end token after
   reaching the thinking budget conditions the image but is excluded from the
   text loss. The text objective runs once per micro-batch, with image-step-count
@@ -253,7 +255,8 @@ The wrapper trains both understanding and generation LoRA projections with FSDP2
   sequence parallelism and timestep staging are unsupported. Merged LoRA sync
   routes the language head separately from the transformer body.
 - `pipeline.max_sequence_length` must hold the system prompt, native prompt and
-  `max_think_tokens + 2` framing budget. Overflow is rejected. Negative prompts
+  `max_think_tokens + 2` framing budget. The default thinking budget is 128;
+  this recipe uses 512 with a total length of 2048. Overflow is rejected. Negative prompts
   are unsupported because text CFG uses the planning system context.
 - Image-only DVReward uses the original FlowGRPO adapter; enabling its upstream
   `think=true` path would not provide joint text training or matching replay. Use

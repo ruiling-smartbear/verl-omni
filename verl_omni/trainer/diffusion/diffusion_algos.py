@@ -398,6 +398,8 @@ class AlphaGRPOLoss(FlowGRPOLoss):
         }
 
     def __call__(self, *, config, model_output, data):
+        if data.get("rollout_is_weights", None) is not None:
+            raise ValueError("AlphaGRPO does not support rollout correction for its joint text/image objective.")
         result = super().__call__(config=config, model_output=model_output, data=data)
         if "text_log_probs" in model_output:
             text_loss, metrics = self.compute_text_loss(

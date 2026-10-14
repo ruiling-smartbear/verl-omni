@@ -66,8 +66,8 @@ class BagelAlphaGRPOPipeline(BagelPipelineWithLogProb):
             text_token_lens=torch.tensor([len(token_ids)], dtype=torch.int, device=self.device),
         )
 
-    def _sample_thinking(self, cache, prefix_length, max_tokens, temperature, top_p, generator):
-        """Return sampled labels and unfiltered temperature-scaled old log-probs [T]."""
+    def _sample_thinking(self, cache, prefix_length, max_tokens, temperature, generator):
+        """Return sampled labels and matching temperature-scaled old log-probs [T]."""
         current = torch.tensor([self.new_token_ids["bos_token_id"]], device=self.device)
         tokens, log_probs = [], []
         for step in range(max_tokens):
@@ -82,12 +82,7 @@ class BagelAlphaGRPOPipeline(BagelPipelineWithLogProb):
             )
             cache = output.past_key_values
             logits = self.bagel.language_model.lm_head(output.packed_query_sequence).float() / temperature
-            sorted_logits, indices = logits.sort(descending=True)
-            probabilities = sorted_logits.softmax(-1)
-            remove = probabilities.cumsum(-1) - probabilities >= top_p
-            filtered = sorted_logits.masked_fill(remove, -torch.inf).softmax(-1)
-            selected = torch.multinomial(filtered, 1, generator=generator)
-            current = indices.gather(-1, selected).squeeze(-1)
+            current = torch.multinomial(logits.softmax(-1), 1, generator=generator).squeeze(-1)
             tokens.append(int(current.item()))
             log_probs.append(logits.log_softmax(-1).gather(-1, current.unsqueeze(-1)).item())
             if tokens[-1] == self.new_token_ids["eos_token_id"]:
@@ -111,12 +106,14 @@ class BagelAlphaGRPOPipeline(BagelPipelineWithLogProb):
             raise ValueError(
                 "AlphaGRPO uses the planning system prompt as its text CFG context, without a negative prompt."
             )
-        max_tokens = int(extra.get("max_think_tokens", 512))
+        max_tokens = int(extra.get("max_think_tokens", 128))
         temperature = float(extra.get("think_temperature", 1.0))
-        top_p = float(extra.get("think_top_p", 0.8))
+        top_p = float(extra.get("think_top_p", 1.0))
         width = int(sampling.max_sequence_length or 2048)
         if max_tokens < 1 or temperature <= 0 or not 0 < top_p <= 1:
             raise ValueError("Thinking requires max_think_tokens >= 1, temperature > 0 and 0 < top_p <= 1.")
+        if top_p != 1.0:
+            raise ValueError("AlphaGRPO requires think_top_p=1 so sampling and replay likelihoods match.")
         bos, eos = self.new_token_ids["bos_token_id"], self.new_token_ids["eos_token_id"]
         prompt_ids = _to_token_list(prompt_ids_from_payload(prompt))
         if not prompt_ids or prompt_ids[0] != bos or prompt_ids[-1] != eos:
@@ -135,7 +132,7 @@ class BagelAlphaGRPOPipeline(BagelPipelineWithLogProb):
             system_cache = self._prefill(NaiveCache(layers), system_ids)
             prefix_cache = self._prefill(deepcopy(system_cache), prompt_ids, len(system_ids))
             tokens, old_log_probs = self._sample_thinking(
-                deepcopy(prefix_cache), len(prefix_ids), max_tokens, temperature, top_p, generator
+                deepcopy(prefix_cache), len(prefix_ids), max_tokens, temperature, generator
             )
             thinking_ids = [bos, *tokens]
             if thinking_ids[-1] != eos:
