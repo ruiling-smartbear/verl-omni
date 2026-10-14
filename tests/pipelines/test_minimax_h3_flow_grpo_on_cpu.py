@@ -23,6 +23,7 @@ import torch
 from tensordict import TensorDict
 from vllm_omni.diffusion.data import DiffusionOutput as VllmDiffusionOutput
 from vllm_omni.diffusion.models.minimax_h3 import MiniMaxH3Pipeline
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 from verl_omni.pipelines.minimax_h3_diffusion_nft.common import MINIMAX_H3_TOKEN_ID_NATIVE_KEY
 from verl_omni.pipelines.minimax_h3_flow_grpo.agent_loop import MiniMaxH3DiffusionSingleTurnAgentLoop
@@ -151,9 +152,12 @@ def test_rollout_output_reaches_actor_and_replays_joint_transition(monkeypatch) 
     pipeline.tokenizer = MagicMock()
     pipeline._flow_grpo_trajectory = trajectory
     request = SimpleNamespace(
+        request_id="h3-contract",
         prompt={"prompt_token_ids": [1, 2]},
-        sampling_params=SimpleNamespace(
+        sampling_params=OmniDiffusionSamplingParams(
             extra_args={MINIMAX_H3_TOKEN_ID_NATIVE_KEY: True},
+            frame_rate=24,
+            output_type="pt",
             max_sequence_length=2,
             num_outputs_per_prompt=1,
         ),
@@ -163,10 +167,11 @@ def test_rollout_output_reaches_actor_and_replays_joint_transition(monkeypatch) 
         prompts=[request.prompt],
         sampling_params=request.sampling_params,
     )
-    video_pixels = torch.zeros(1, 3, 2, 8, 8, dtype=torch.uint8)
-    audio_waveform = torch.zeros(1, 32000)
+    video_pixels = torch.zeros(1, 2, 8, 8, 3, dtype=torch.uint8)
+    audio_waveform = torch.zeros(1, 2, 32000)
 
     def fake_forward(*args):
+        pipeline._flow_grpo_final_latents = (torch.zeros(1, 24, 2, 4, 4), torch.zeros(2, 32, 8))
         pipeline._flow_grpo_trajectory = trajectory
         return VllmDiffusionOutput(output=(video_pixels, audio_waveform))
 
@@ -181,13 +186,15 @@ def test_rollout_output_reaches_actor_and_replays_joint_transition(monkeypatch) 
     assert set(metadata["prompt_embeddings"]) == {"prompt_embeds", "prompt_embeds_mask"}
     assert "all_next_latents" in metadata["rl"]
 
-    final_res = SimpleNamespace(
-        images=[(video_pixels, audio_waveform)],
+    from vllm_omni.outputs import OmniRequestOutput
+
+    final_res = OmniRequestOutput.from_diffusion(
+        request_id="h3-flow-test",
+        images=rollout_output.output["payload"]["video"],
         trajectory_latents=rollout_output.trajectory_latents,
         trajectory_timesteps=rollout_output.trajectory_timesteps,
         trajectory_log_probs=rollout_output.trajectory_log_probs,
-        multimodal_output=rollout_output.output,
-        request_output=None,
+        multimodal_output={"metadata": rollout_output.output["metadata"]},
     )
     server = object.__new__(vLLMOmniHttpServer)
     server.global_steps = 1
@@ -706,6 +713,66 @@ def test_denoise_locked_audio_rows_sets_branch_and_prev_sample(monkeypatch) -> N
     torch.testing.assert_close(trajectory["h3_audio_timesteps"], torch.ones((1, 2)))
 
 
+_EDIT_ROW_KEYS = (
+    "video_edit_clean_rows",
+    "video_edit_mask_rows",
+    "video_edit_restore_mask_rows",
+    "audio_edit_clean_rows",
+    "audio_edit_mask_rows",
+    "audio_edit_restore_mask_rows",
+)
+
+
+class _InputsAccepted(Exception):
+    """Raised by the stubbed noise sampler to prove diffuse() got past its input gate."""
+
+
+def _diffuse_with_forwarded(**forwarded):
+    pipeline = object.__new__(MiniMaxH3PipelineWithLogProb)
+    pipeline.device = torch.device("cpu")
+    pipeline._initial_noise = MagicMock(side_effect=_InputsAccepted)
+    return pipeline.diffuse(
+        task="t2va",
+        text_embeddings=torch.zeros(2, 8),
+        text_tags=torch.ones(2, dtype=torch.long),
+        seed=7,
+        latent_t=1,
+        latent_h=4,
+        latent_w=4,
+        audio_t=3,
+        num_frames=1,
+        num_steps=6,
+        video_shift=12.0,
+        audio_shift=3.0,
+        visual_condition=None,
+        visual_condition_shape=None,
+        audio_condition=None,
+        ref_audio_t=None,
+        **forwarded,
+    )
+
+
+@pytest.mark.parametrize("key", [*_EDIT_ROW_KEYS, "some_future_upstream_input"])
+def test_denoise_rejects_unsupported_forwarded_inputs_instead_of_ignoring_them(key) -> None:
+    """vLLM-Omni forwards latent-edit rows; FlowGRPO has no edit path, so silently dropping them would
+    train on plain generations while the request asked for an edit."""
+    with pytest.raises(NotImplementedError, match=key):
+        _diffuse_with_forwarded(**{key: torch.zeros(2, 4)})
+
+
+def test_denoise_rejects_a_complete_edit_request() -> None:
+    rows = {key: torch.zeros(2, 4) for key in _EDIT_ROW_KEYS}
+    with pytest.raises(NotImplementedError) as excinfo:
+        _diffuse_with_forwarded(**rows)
+    assert all(key in str(excinfo.value) for key in _EDIT_ROW_KEYS)
+
+
+def test_denoise_accepts_unused_forwarded_inputs_set_to_none() -> None:
+    """Upstream always forwards every denoise input key, with None for the ones the request does not use."""
+    with pytest.raises(_InputsAccepted):
+        _diffuse_with_forwarded(**dict.fromkeys(_EDIT_ROW_KEYS))
+
+
 def _batched_actor_payload(batch_size: int = 2) -> dict[str, torch.Tensor]:
     """Repeat a valid single-sample rollout payload into one Actor micro-batch."""
     payload = _trajectory()
@@ -806,3 +873,39 @@ def test_actor_rejects_non_replayable_rollout_contract_before_transformer(
     # prepare_model_inputs only validates and reshapes data; a bad rollout must
     # never invoke the model or defer the error until the expensive forward.
     module.assert_not_called()
+
+
+def test_meta_placeholder_output_returns_preserved_rollout_result(monkeypatch) -> None:
+    """A non-replying offload rank carries a placeholder, so the rollout result is returned as is."""
+    trajectory = _trajectory()
+    pipeline = object.__new__(MiniMaxH3PipelineWithLogProb)
+    pipeline.tokenizer = MagicMock()
+    pipeline._flow_grpo_trajectory = trajectory
+    request = SimpleNamespace(
+        request_id="h3-meta",
+        prompt={"prompt_token_ids": [1, 2]},
+        sampling_params=OmniDiffusionSamplingParams(
+            extra_args={MINIMAX_H3_TOKEN_ID_NATIVE_KEY: True},
+            frame_rate=24,
+            output_type="pt",
+            max_sequence_length=2,
+            num_outputs_per_prompt=1,
+        ),
+    )
+    request_batch = SimpleNamespace(
+        requests=[request],
+        prompts=[request.prompt],
+        sampling_params=request.sampling_params,
+    )
+
+    def fake_forward(*args):
+        pipeline._flow_grpo_final_latents = (torch.zeros(1, 24, 2, 4, 4), torch.zeros(2, 32, 8))
+        pipeline._flow_grpo_trajectory = trajectory
+        return VllmDiffusionOutput(output=torch.empty(1, device="meta"))
+
+    with patch.object(MiniMaxH3Pipeline, "forward", side_effect=fake_forward):
+        rollout_output = pipeline.forward(request_batch)
+
+    assert pipeline._flow_grpo_final_latents is None
+    assert "media_artifacts" not in rollout_output.output.get("metadata", {})
+    torch.testing.assert_close(rollout_output.trajectory_latents, trajectory["all_latents"])
