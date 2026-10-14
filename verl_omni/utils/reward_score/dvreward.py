@@ -20,9 +20,9 @@ from collections.abc import Mapping, Sequence
 
 import aiohttp
 import torch
-from PIL import Image
 
-from verl_omni.utils.reward_score.reward_utils import pil_image_to_base64
+from verl_omni.pipelines.rollout_media import ArtifactContractError, select_artifact
+from verl_omni.utils.reward_score.reward_utils import image_tensor_to_pil, pil_image_to_base64
 
 
 def normalize_questions(questions: Sequence[str | Mapping]) -> list[str]:
@@ -72,9 +72,26 @@ async def compute_score_dvreward(
     """Score uint8 RGB [3, H, W] with semantic/quality geometric mean in [0, 1]."""
     semantic = normalize_questions(extra_info["semantic_questions"])
     quality = normalize_questions(extra_info["quality_questions"])
-    if solution_image.dtype != torch.uint8 or solution_image.ndim != 3 or solution_image.shape[0] != 3:
-        raise ValueError("DVReward expects a uint8 RGB image with shape [3, H, W]")
-    image = Image.fromarray(solution_image.detach().permute(1, 2, 0).cpu().numpy())
+    if "media_artifacts" in extra_info:
+        artifact = select_artifact(
+            extra_info["media_artifacts"],
+            name=extra_info.get("preview_artifact"),
+            modality="image",
+            representation="decoded",
+        )
+        if artifact.spec.layout != "CHW":
+            raise ArtifactContractError("DVReward requires a canonical CHW image preview")
+        solution_image = artifact.data
+    elif extra_info.get("media_kind") != "image":
+        raise ArtifactContractError("DVReward requires a named decoded image preview or explicit media_kind='image'")
+    if (
+        solution_image.dtype != torch.uint8
+        or solution_image.ndim != 3
+        or solution_image.shape[0] != 3
+        or solution_image.numel() == 0
+    ):
+        raise ArtifactContractError("DVReward expects a uint8 RGB image with shape [3, H, W]")
+    image = image_tensor_to_pil(solution_image)
     image_url = await asyncio.to_thread(pil_image_to_base64, image)
     params = {"temperature": 0.0, "top_p": 0.9, "max_tokens": 10, **(sampling_params or {})}
     semaphore = asyncio.Semaphore(8)
