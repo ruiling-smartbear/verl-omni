@@ -43,7 +43,15 @@ def pipeline():
 
 
 @pytest.mark.parametrize(
-    "caption", ["user interface of a dashboard", "user-friendly camera", "user\npainting a house", "a cat"]
+    "caption",
+    [
+        "user interface of a dashboard",
+        "user-friendly camera",
+        "user\npainting a house",
+        "a cat",
+        " user-friendly camera ",
+        "\nuser interface\t",
+    ],
 )
 def test_native_caption_and_request_flag(caption):
     p = pipeline()
