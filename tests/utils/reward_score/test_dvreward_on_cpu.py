@@ -26,7 +26,7 @@ from aiohttp import web
 from PIL import Image
 
 from verl_omni.pipelines.rollout_media import ArtifactContractError, MediaArtifact, MediaSpec
-from verl_omni.utils.reward_score.dvreward import compute_score_dvreward
+from verl_omni.utils.reward_score.dvreward import _yes_probability, compute_score_dvreward
 
 
 def image_info():
@@ -126,3 +126,25 @@ async def test_empty_legacy_image_fails_before_http():
         await compute_score_dvreward(
             "test", torch.empty(3, 0, 8, dtype=torch.uint8), "cat", info, "unreachable", "judge"
         )
+
+
+@pytest.mark.parametrize(
+    "logprobs", [None, {}, {"content": None}, {"content": []}, {"content": [{}]}, {"content": [{"top_logprobs": None}]}]
+)
+@pytest.mark.parametrize("answer,expected", [("yes", 1.0), ("No.", 0.0)])
+def test_missing_logprobs_falls_back_to_answer(logprobs, answer, expected):
+    choice = {"message": {"content": answer}}
+    if logprobs is not None:
+        choice["logprobs"] = logprobs
+    else:
+        choice["logprobs"] = None
+    assert _yes_probability({"choices": [choice]}) == expected
+
+
+def test_absent_logprobs_falls_back_to_answer():
+    assert _yes_probability({"choices": [{"message": {"content": "yes"}}]}) == 1.0
+
+
+def test_fallback_rejects_non_binary_answer():
+    with pytest.raises(ValueError, match="yes or no"):
+        _yes_probability({"choices": [{"logprobs": None, "message": {"content": "maybe"}}]})
