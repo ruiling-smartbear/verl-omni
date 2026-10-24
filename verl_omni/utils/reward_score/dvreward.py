@@ -43,7 +43,10 @@ def normalize_questions(questions: Sequence[str | Mapping]) -> list[str]:
 def _yes_probability(completion: dict) -> float:
     choice = completion["choices"][0]
     probabilities = {"yes": 0.0, "no": 0.0}
-    for item in choice["logprobs"]["content"][0]["top_logprobs"]:
+    logprobs = choice.get("logprobs") or {}
+    content = logprobs.get("content") or []
+    top_logprobs = (content[0].get("top_logprobs") or []) if content else []
+    for item in top_logprobs:
         answer = item["token"].lower().strip().translate(str.maketrans("", "", ".,?!"))
         if answer in probabilities:
             logprob = item["logprob"]
