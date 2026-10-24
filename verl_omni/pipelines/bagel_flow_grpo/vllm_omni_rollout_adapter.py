@@ -288,6 +288,8 @@ class BagelPipelineWithLogProb(BagelPipeline):
         """Decode BAGEL token IDs to a cleaned prompt text string."""
         token_list = _to_token_list(token_ids)
         if not token_list:
+            if native:
+                raise ValueError("Native BAGEL prompts must preserve start/end token framing.")
             return None
         if native:
             bos = self.tokenizer.convert_tokens_to_ids("<|im_start|>")
