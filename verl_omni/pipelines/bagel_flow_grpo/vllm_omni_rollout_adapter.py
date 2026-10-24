@@ -296,7 +296,7 @@ class BagelPipelineWithLogProb(BagelPipeline):
             eos = self.tokenizer.convert_tokens_to_ids("<|im_end|>")
             if token_list[0] != bos or token_list[-1] != eos:
                 raise ValueError("Native BAGEL prompts must preserve start/end token framing.")
-            return self.tokenizer.decode(token_list[1:-1], skip_special_tokens=False).strip()
+            return self.tokenizer.decode(token_list[1:-1], skip_special_tokens=False)
         decoded = self.tokenizer.decode(token_list, skip_special_tokens=False)
         return _extract_prompt_text(decoded)
 
