@@ -79,12 +79,13 @@ class LanceTrainingConfig(BagelTrainingConfig):
     mrope_section: tuple[int, ...] = LANCE_MROPE_SECTION
 
     @classmethod
-    def from_model_path(cls, model_path: str) -> LanceTrainingConfig:
+    def from_model_path(cls, model_path: str, *, trust_remote_code: bool = False) -> LanceTrainingConfig:
         """Build a config from a Lance checkpoint directory.
 
         Args:
             model_path: Either the bundle root (which owns ``Lance_3B/``) or a
                 checkpoint directory containing ``llm_config.json``.
+            trust_remote_code: Whether the tokenizer fallback may load custom code.
 
         Returns:
             Config with LLM dimensions from ``llm_config.json`` and Lance's
@@ -94,7 +95,9 @@ class LanceTrainingConfig(BagelTrainingConfig):
         with open(os.path.join(ckpt_dir, "llm_config.json")) as f:
             llm = json.load(f)
 
-        start_of_image_id, end_of_image_id = _resolve_boundary_token_ids(ckpt_dir, llm)
+        start_of_image_id, end_of_image_id = _resolve_boundary_token_ids(
+            ckpt_dir, llm, trust_remote_code=trust_remote_code
+        )
         rope_scaling = llm.get("rope_scaling") or {}
         mrope_section = rope_scaling.get("mrope_section") or LANCE_MROPE_SECTION
         return cls(
@@ -139,7 +142,7 @@ def resolve_checkpoint_dir(model_path: str) -> str:
     )
 
 
-def _resolve_boundary_token_ids(ckpt_dir: str, llm_config: dict) -> tuple[int, int]:
+def _resolve_boundary_token_ids(ckpt_dir: str, llm_config: dict, *, trust_remote_code: bool) -> tuple[int, int]:
     """Resolve the image boundary token IDs for a Lance checkpoint.
 
     ``llm_config.json`` carries ``vision_start_token_id`` /
@@ -150,6 +153,7 @@ def _resolve_boundary_token_ids(ckpt_dir: str, llm_config: dict) -> tuple[int, i
     Args:
         ckpt_dir: Checkpoint directory, which also holds the tokenizer.
         llm_config: Parsed ``llm_config.json``.
+        trust_remote_code: Whether the tokenizer may load custom code.
 
     Returns:
         ``(start_of_image_id, end_of_image_id)``.
@@ -161,7 +165,7 @@ def _resolve_boundary_token_ids(ckpt_dir: str, llm_config: dict) -> tuple[int, i
 
     from transformers import AutoTokenizer
 
-    tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, trust_remote_code=True)
+    tokenizer = AutoTokenizer.from_pretrained(ckpt_dir, trust_remote_code=trust_remote_code)
     start = tokenizer.convert_tokens_to_ids("<|vision_start|>")
     end = tokenizer.convert_tokens_to_ids("<|vision_end|>")
     if start is None or end is None or tokenizer.unk_token_id in (start, end):
@@ -543,7 +547,9 @@ class LanceForTraining(BagelForTraining):
         return (self.llm2vae(latent_output),)
 
     @classmethod
-    def from_pretrained(cls, model_path: str, torch_dtype=torch.bfloat16) -> LanceForTraining:
+    def from_pretrained(
+        cls, model_path: str, torch_dtype=torch.bfloat16, *, trust_remote_code: bool = False
+    ) -> LanceForTraining:
         """Load a Lance checkpoint.
 
         Shapes that the released checkpoint decides - the extended vocabulary
@@ -553,12 +559,13 @@ class LanceForTraining(BagelForTraining):
         Args:
             model_path: Bundle root or checkpoint directory.
             torch_dtype: Target dtype.
+            trust_remote_code: Whether the tokenizer fallback may load custom code.
 
         Returns:
             A ``LanceForTraining`` with the checkpoint applied.
         """
         ckpt_dir = resolve_checkpoint_dir(model_path)
-        config = LanceTrainingConfig.from_model_path(ckpt_dir)
+        config = LanceTrainingConfig.from_model_path(ckpt_dir, trust_remote_code=trust_remote_code)
         state_dict = load_lance_state_dict(ckpt_dir)
         mapped = map_lance_checkpoint_to_training(state_dict)
 
