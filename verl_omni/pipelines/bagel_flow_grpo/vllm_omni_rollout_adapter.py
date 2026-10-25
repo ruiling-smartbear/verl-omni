@@ -350,8 +350,8 @@ class BagelPipelineWithLogProb(BagelPipeline):
 
     def _decode_image_from_latent(self, bagel, vae, latent, image_shape):
         # Upstream decodes the final sample before optional trajectory previews.
-        if self._final_image_latent is None:
-            self._final_image_latent = latent
+        if self._final_latent is None:
+            self._final_latent = latent
         return super()._decode_image_from_latent(bagel, vae, latent, image_shape)
 
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
@@ -407,14 +407,12 @@ class BagelPipelineWithLogProb(BagelPipeline):
         )
 
         # vllm-omni >= 0.24 (#4509) matches official BAGEL: n schedule points, n-1 denoise steps.
-        self._final_image_latent = None
+        self._final_latent = None
         output = super().forward(req)
-        native_latent = self._final_image_latent
-        self._final_image_latent = None
+        native_latent = self._final_latent
+        self._final_latent = None
         if native_latent is None:
-            raise RuntimeError(
-                f"pipeline={type(self).__name__}, request_id={req.request_id}: no final native image latent"
-            )
+            raise RuntimeError(f"pipeline={type(self).__name__}, request_id={req.request_id}: no final native latent")
 
         # Slice trajectory to the SDE window so training only sees noisy steps.
         traj_latents, traj_timesteps, traj_log_probs = _extract_bagel_trajectory(output)
@@ -432,6 +430,18 @@ class BagelPipelineWithLogProb(BagelPipeline):
         if traj_log_probs is not None:
             traj_log_probs = traj_log_probs.unsqueeze(0)
 
+        return self._build_flowgrpo_output(req, output, native_latent, traj_latents, traj_timesteps, traj_log_probs)
+
+    def _build_flowgrpo_output(
+        self,
+        req: OmniDiffusionRequest,
+        output: DiffusionOutput,
+        native_latent: torch.Tensor,
+        traj_latents: torch.Tensor | None,
+        traj_timesteps: torch.Tensor | None,
+        traj_log_probs: torch.Tensor | None,
+    ) -> DiffusionOutput:
+        """Attach image artifacts while preserving recorded training tensors."""
         payload = output.output["payload"]
         context = f"pipeline={type(self).__name__}, request_id={req.request_id}"
         if "image" not in payload or payload.keys() - {"image", "trajectory"}:
