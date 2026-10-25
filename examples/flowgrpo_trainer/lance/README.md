@@ -175,10 +175,17 @@ Input JSONL fields are documented in those preparation scripts.
 
 M3 depends on M2 and vllm-omni#7907. Its conditioning interface still needs
 maintainer agreement. The i2v replay applies timestep zero to reference-frame
-tokens. The companion rollout still lacks reference-latent restoration in its
-SDE branch, and this trainer lacks a per-token objective mask. Thus i2v remains
-experimental; the earlier replay metric does not prove a fixed first frame.
+tokens. After the full forward and CFG, only unfixed tokens enter the scheduler,
+so log-probs and KL means exclude the reference frame. This requires the companion
+rollout's active-token SDE sampling fix; the earlier replay metric does not prove
+a fixed first frame or validate this corrected objective. i2v remains experimental.
 Full training, convergence and current-version GPU validation are not claimed.
+Regenerate trajectories and old log-probs with the matching rollout sampler;
+recordings from its earlier all-token SDE path are incompatible with this objective.
+
+Each batch must use the same latent shape and number of distinct fixed tokens;
+their positions may differ between samples. The active tokens retain their original
+order. All-fixed trajectories are rejected because they have no stochastic action.
 
 The edit replay contract assumes the reference VAE block and the generated block
 share the same latent grid, as vllm-omni#7907 constructs them. ViT rows attend only

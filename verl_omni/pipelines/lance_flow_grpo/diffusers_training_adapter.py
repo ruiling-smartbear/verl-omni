@@ -140,6 +140,30 @@ class LanceDiffusion(BagelDiffusion):
                 timestep = timestep[:, None].expand(-1, latent_tokens)
             inputs["timestep"] = timestep.scatter(-1, indexes, 0.0)
 
+    @staticmethod
+    def _select_scheduler_tokens(
+        sample: torch.Tensor,
+        model_output: torch.Tensor,
+        prev_sample: torch.Tensor,
+        scheduler_inputs,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        """Exclude fixed reference tokens from log-probs and the returned KL means."""
+        pinned = scheduler_inputs.get("frame_condition_token_indexes")
+        if pinned is None or pinned.numel() == 0:
+            return sample, model_output, prev_sample
+        batch_size, num_tokens, channels = sample.shape
+        indexes = pinned.to(sample.device, torch.long)
+        if indexes.ndim == 1:
+            indexes = indexes.unsqueeze(0).expand(batch_size, -1)
+        active_tokens = num_tokens - indexes.shape[1]
+        if active_tokens <= 0:
+            raise ValueError("Lance replay requires at least one unpinned latent token.")
+        active = torch.ones((batch_size, num_tokens), dtype=torch.bool, device=sample.device)
+        active.scatter_(1, indexes, False)
+        positions = torch.arange(num_tokens, device=sample.device).expand(batch_size, -1)
+        selected = positions[active].reshape(batch_size, active_tokens, 1).expand(-1, -1, channels)
+        return tuple(tensor.gather(1, selected) for tensor in (sample, model_output, prev_sample))
+
     #: Rollout-exported fields an image-edit trajectory replays with.
     _CONDITION_KEYS = (
         "condition_prefix_ids",
