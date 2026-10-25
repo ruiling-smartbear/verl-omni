@@ -54,7 +54,14 @@ class LancePipelineWithLogProb(BagelPipelineWithLogProb, LancePipeline):
 
     def _ensure_bagel_prompt_text(self, req: OmniDiffusionRequest) -> None:
         super()._ensure_bagel_prompt_text(req)
-        req.prompts[0]["modalities"] = ["video" if self._is_video else "image"]
+        prompt = req.prompts[0]
+        prompt["modalities"] = ["video" if self._is_video else "image"]
+        media = prompt.get("multi_modal_data") or {}
+        if self._is_video and "image" in media:
+            if "first_frame" in media or "video" in media:
+                raise ValueError("Lance video requests accept one reference image or one reference video.")
+            prompt["multi_modal_data"] = {key: value for key, value in media.items() if key != "image"}
+            prompt["multi_modal_data"]["first_frame"] = media["image"]
 
     def _decode_video_from_latent(self, bagel, vae, latent, video_shape):
         if self._final_latent is None:

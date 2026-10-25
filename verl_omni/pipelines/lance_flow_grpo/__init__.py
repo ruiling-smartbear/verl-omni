@@ -13,8 +13,15 @@
 # limitations under the License.
 
 
+from .agent_loop import LanceDiffusionSingleTurnAgentLoop
 from .diffusers_training_adapter import LanceDiffusion
 from .lance_model import LanceForTraining, LanceTrainingConfig
 from .vllm_omni_rollout_adapter import LancePipelineWithLogProb
 
-__all__ = ["LanceDiffusion", "LanceForTraining", "LancePipelineWithLogProb", "LanceTrainingConfig"]
+__all__ = [
+    "LanceDiffusion",
+    "LanceDiffusionSingleTurnAgentLoop",
+    "LanceForTraining",
+    "LancePipelineWithLogProb",
+    "LanceTrainingConfig",
+]

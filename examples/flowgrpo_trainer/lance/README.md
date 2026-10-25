@@ -161,3 +161,41 @@ dependency and current-version GPU replay validation are available.
 
 Long training, convergence and throughput benchmarks require maintainer resources;
 the smoke recipe covers two updates and does not establish convergence.
+
+## Conditioning (M3 draft)
+
+The image-edit, image-to-video and video-edit recipes use a Lance agent loop
+that carries reference media beside the text prompt. The adapter maps a video
+request's image to `first_frame` and preserves exported conditioning rows and
+positions for replay. Shared workers and their request schema are unchanged.
+
+Prepare each dataset with `data_process/lance_{image_edit,i2v,video_edit}.py`,
+then use the corresponding `run_lance_*_lora.sh` or two-update smoke script.
+Input JSONL fields are documented in those preparation scripts.
+
+M3 depends on M2 and vllm-omni#7907. Its conditioning interface still needs
+maintainer agreement. The i2v replay applies timestep zero to reference-frame
+tokens. After the full forward and CFG, only unfixed tokens enter the scheduler,
+so log-probs and KL means exclude the reference frame. This requires the companion
+rollout's active-token SDE sampling fix; the earlier replay metric does not prove
+a fixed first frame or validate this corrected objective. i2v remains experimental.
+Full training, convergence and current-version GPU validation are not claimed.
+Regenerate trajectories and old log-probs with the matching rollout sampler;
+recordings from its earlier all-token SDE path are incompatible with this objective.
+
+Each batch must use the same latent shape and number of distinct fixed tokens;
+their positions may differ between samples. The active tokens retain their original
+order. All-fixed trajectories are rejected because they have no stochastic action.
+
+The edit replay contract assumes the reference VAE block and the generated block
+share the same latent grid, as vllm-omni#7907 constructs them. ViT rows attend only
+to the prefix and ViT block; VAE rows can additionally attend to the VAE block.
+The CPU regression compares those segments with an independent dense attention mask.
+
+Video editing samples the reference at 12 fps in vllm-omni. Its recipe declares
+12 fps for emitted video artifacts; text-to-video and i2v retain the configured
+frame rate.
+
+Reference media stays raw through the agent loop. Qwen's dataset video decoder
+returns tensors plus metadata and can resample frames; Lance instead requires
+the original path or decoded PIL frames so its own sampler sees the source clip.

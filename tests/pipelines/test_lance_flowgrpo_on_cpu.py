@@ -1062,3 +1062,319 @@ def test_config_propagates_tokenizer_load_failure(tmp_path, monkeypatch):
     monkeypatch.setattr(AutoTokenizer, "from_pretrained", Mock(side_effect=OSError("broken tokenizer")))
     with pytest.raises(OSError, match="broken tokenizer"):
         LanceTrainingConfig.from_model_path(str(tmp_path))
+
+
+def _synthetic_edit_condition(
+    batch: int = 1, prefix: int = 3, ref: int = 9, tail: int = 4, latent: int = 4, hidden: int = 64
+):
+    """A condition bundle shaped like the rollout's image-edit export."""
+    return {
+        "condition_prefix_ids": torch.randint(1, 190, (batch, prefix)),
+        "condition_prefix_positions": torch.arange(prefix).expand(batch, -1),
+        "condition_ref_rows": torch.randn(batch, ref, hidden),
+        "condition_ref_positions": torch.arange(prefix, prefix + ref).expand(3, -1).unsqueeze(0).expand(batch, -1, -1),
+        "condition_ref_is_gen": torch.cat(
+            [
+                torch.zeros(batch, ref - latent - 1, dtype=torch.bool),
+                torch.ones(batch, latent, dtype=torch.bool),
+                torch.zeros(batch, 1, dtype=torch.bool),
+            ],
+            dim=1,
+        ),
+        "condition_tail_ids": torch.randint(1, 190, (batch, tail)),
+        "condition_tail_positions": torch.arange(prefix + ref, prefix + ref + tail).expand(batch, -1),
+        "condition_tail_mask": torch.ones(batch, tail, dtype=torch.bool),
+        "condition_latent_positions": torch.zeros(batch, 3, latent + 2, dtype=torch.long),
+        "condition_latent_grid": torch.arange(latent).expand(batch, -1),
+    }
+
+
+def test_lance_replays_an_edit_condition_from_the_rollout():
+    """Exported reference rows, their routing and the latent basis all matter.
+
+    ``_forward_image_edit`` prefills the reference through the ViT and the VAE,
+    which this model cannot do; the rows and the positions they sat at travel
+    with the trajectory, and the replay has to use them rather than rebuild a
+    context of its own.
+    """
+    config = _tiny_config()
+    config.max_latent_size = 8
+    model = LanceForTraining(config).float()
+    latent = torch.randn(1, 4, config.patch_latent_dim)
+    timestep = torch.tensor([0.6])
+    condition = _synthetic_edit_condition()
+
+    (velocity,) = model(hidden_states=latent, timestep=timestep, condition=condition)
+    assert velocity.shape == (1, 4, config.patch_latent_dim)
+    assert torch.isfinite(velocity).all()
+
+    # The reference rows are part of the context, not decoration.
+    perturbed = {**condition, "condition_ref_rows": condition["condition_ref_rows"] + 1.0}
+    (other,) = model(hidden_states=latent, timestep=timestep, condition=perturbed)
+    assert not torch.allclose(velocity, other)
+
+    # The latent block's rotary basis is the rollout's, used verbatim.
+    shifted = {**condition, "condition_latent_positions": condition["condition_latent_positions"] + 5}
+    (moved,) = model(hidden_states=latent, timestep=timestep, condition=shifted)
+    assert not torch.allclose(velocity, moved)
+
+
+def test_lance_edit_condition_ignores_padded_tail_slots():
+    """Padding only keeps the batch rectangular, so it must not be attended to."""
+    config = _tiny_config()
+    config.max_latent_size = 8
+    model = LanceForTraining(config).float()
+    latent = torch.randn(1, 4, config.patch_latent_dim)
+    timestep = torch.tensor([0.6])
+    condition = _synthetic_edit_condition()
+    condition["condition_tail_mask"] = torch.tensor([[True, True, False, False]])
+    condition["condition_tail_positions"] = condition["condition_tail_positions"].clone()
+    condition["condition_tail_positions"][0, 2:] = 0
+
+    (velocity,) = model(hidden_states=latent, timestep=timestep, condition=condition)
+
+    noisy = {**condition, "condition_tail_ids": condition["condition_tail_ids"].clone()}
+    noisy["condition_tail_ids"][0, 2:] = 190  # outside the real instruction
+    (other,) = model(hidden_states=latent, timestep=timestep, condition=noisy)
+
+    assert torch.allclose(velocity, other), "masked tail slots changed the prediction"
+
+
+def test_lance_positions_honor_the_rollouts_anchor():
+    """The latent block sits where the rollout put it, not after the text.
+
+    Lance's edit modes anchor the noise block at the reference VAE block's
+    positions, which is what lets the model map noise tokens onto reference
+    tokens; a replay that assumed the text length would rotate the whole block.
+    """
+    config = _tiny_config()
+    config.max_latent_size = 64
+    model = LanceForTraining(config)
+    latent_pos_ids = get_flattened_position_ids(_IMAGE_HW, _IMAGE_HW, _LATENT_DOWNSAMPLE, 64)
+    latent_pos_ids = latent_pos_ids.unsqueeze(0).expand(2, -1)
+    num_text = 5
+    anchor = torch.tensor([64, 96])
+
+    default = model.build_position_ids(2, num_text, latent_pos_ids.shape[1], latent_pos_ids, torch.device("cpu"))
+    shifted = model.build_position_ids(
+        2,
+        num_text,
+        latent_pos_ids.shape[1],
+        latent_pos_ids,
+        torch.device("cpu"),
+        text_attention_mask=torch.ones(2, num_text, dtype=torch.bool),
+        position_anchor=anchor,
+    )
+
+    # The text rows are untouched; every block row moves by the anchor delta.
+    assert torch.equal(default[:, :, :num_text], shifted[:, :, :num_text])
+    delta = (anchor - num_text).reshape(2, 1, 1)
+    assert torch.equal(shifted[:, :, num_text:], default[:, :, num_text:] + delta)
+
+
+@pytest.mark.parametrize("is_video,reference", [(False, "image"), (True, "image"), (True, "video")])
+def test_lance_condition_routing_keeps_reference(is_video, reference):
+    from verl_omni.pipelines.lance_flow_grpo.vllm_omni_rollout_adapter import LancePipelineWithLogProb
+
+    pipeline = object.__new__(LancePipelineWithLogProb)
+    pipeline._is_video = is_video
+    image = object()
+    media = {reference: image}
+    request = SimpleNamespace(
+        prompts=[{"prompt": "edit this", "multi_modal_data": media}], sampling_params=SimpleNamespace(extra_args={})
+    )
+    pipeline._ensure_bagel_prompt_text(request)
+    expected = "first_frame" if is_video and reference == "image" else reference
+    assert request.prompts[0]["multi_modal_data"][expected] is image
+    assert media == {reference: image}
+
+
+def test_lance_rejects_ambiguous_video_reference():
+    from verl_omni.pipelines.lance_flow_grpo.vllm_omni_rollout_adapter import LancePipelineWithLogProb
+
+    pipeline = object.__new__(LancePipelineWithLogProb)
+    pipeline._is_video = True
+    request = SimpleNamespace(
+        prompts=[{"prompt": "edit", "multi_modal_data": {"image": object(), "video": object()}}],
+        sampling_params=SimpleNamespace(extra_args={}),
+    )
+    with pytest.raises(ValueError, match="one reference"):
+        pipeline._ensure_bagel_prompt_text(request)
+
+
+def test_i2v_replay_uses_zero_sigma_only_on_pinned_tokens():
+    from verl_omni.pipelines.lance_flow_grpo.diffusers_training_adapter import LanceDiffusion
+
+    conditional = {"hidden_states": torch.zeros(2, 6, 48), "timestep": torch.tensor([0.7, 0.3])}
+    unconditional = {**conditional}
+    original = conditional["timestep"].clone()
+    LanceDiffusion._set_reference_timesteps(
+        conditional, unconditional, {"frame_condition_token_indexes": torch.tensor([[0, 1], [0, 1]])}
+    )
+    for inputs in (conditional, unconditional):
+        torch.testing.assert_close(inputs["timestep"][:, :2], torch.zeros(2, 2))
+        torch.testing.assert_close(inputs["timestep"][:, 2:], original[:, None].expand(-1, 4))
+    torch.testing.assert_close(original, torch.tensor([0.7, 0.3]))
+
+
+def test_edit_attention_matches_ordered_prefill_visibility(monkeypatch):
+    import torch.nn.functional as functional
+
+    model = LanceForTraining(_tiny_config()).float()
+    condition = _synthetic_edit_condition()
+    calls = []
+    sdpa = functional.scaled_dot_product_attention
+
+    def record(query, key, value, **kwargs):
+        # Compare visibility in fp32, independently of bf16 rounding at segment boundaries.
+        result = sdpa(query.float(), key.float(), value.float(), **kwargs)
+        calls.append((query.float(), key.float(), value.float(), result))
+        return result.to(query.dtype)
+
+    monkeypatch.setattr(functional, "scaled_dot_product_attention", record)
+    model(hidden_states=torch.randn(1, 4, 48), timestep=torch.tensor([0.6]), condition=condition)
+    # Prefix, ViT, VAE, instruction and generated latent are distinct prefills.
+    mask = torch.zeros(22, 22, dtype=torch.bool)
+    mask[:3, :3] = torch.ones(3, 3, dtype=torch.bool).tril()
+    mask[3:6, :6] = True
+    mask[6:12, :12] = True
+    mask[12:16, :16] = torch.arange(16)[None] <= torch.arange(12, 16)[:, None]
+    mask[16:, :] = True
+    assert len(calls) == 5 * len(model.layers)
+    for layer in range(len(model.layers)):
+        blocks = calls[layer * 5 : (layer + 1) * 5]
+        queries = torch.cat([block[0] for block in blocks], dim=2)
+        expected = sdpa(queries, blocks[-1][1], blocks[-1][2], attn_mask=mask[None, None])
+        actual = torch.cat([block[3] for block in blocks], dim=2)
+        torch.testing.assert_close(actual, expected, atol=1e-6, rtol=1e-5)
+
+
+def test_i2v_pinned_indexes_stay_sample_local():
+    from verl_omni.pipelines.lance_flow_grpo.diffusers_training_adapter import LanceDiffusion
+
+    inputs = {"hidden_states": torch.zeros(2, 6, 48), "timestep": torch.ones(2)}
+    negative = {**inputs}
+    LanceDiffusion._set_reference_timesteps(
+        inputs, negative, {"frame_condition_token_indexes": torch.tensor([[0, 1], [2, 3]])}
+    )
+    expected = torch.tensor([[0.0, 0.0, 1.0, 1.0, 1.0, 1.0], [1.0, 1.0, 0.0, 0.0, 1.0, 1.0]])
+    torch.testing.assert_close(inputs["timestep"], expected)
+    torch.testing.assert_close(negative["timestep"], expected)
+
+
+@pytest.mark.parametrize("pinned", [None, torch.empty(0, dtype=torch.long), torch.empty(2, 0, dtype=torch.long)])
+def test_lance_unpinned_scheduler_inputs_are_unchanged(pinned):
+    tensors = tuple(torch.randn(2, 6, 4) for _ in range(3))
+    metadata = {} if pinned is None else {"frame_condition_token_indexes": pinned}
+    selected = LanceDiffusion._select_scheduler_tokens(*tensors, metadata)
+    assert all(actual is original for actual, original in zip(selected, tensors, strict=True))
+
+
+@pytest.mark.parametrize("pinned", [torch.tensor([0, 1]), torch.tensor([[1, 0], [4, 2]])])
+@pytest.mark.parametrize("cfg_scale", [1.0, 4.0])
+@pytest.mark.parametrize("sde_type", ["sde", "cps", "dance_sde"])
+def test_i2v_replay_scores_only_active_tokens_after_full_cfg(pinned, cfg_scale, sde_type):
+    scheduler = FlowMatchSDEDiscreteScheduler()
+    setup_lance_sigmas(scheduler, 4, device="cpu")
+    latents = torch.linspace(-1.0, 1.0, 2 * 2 * 6 * 4).reshape(2, 2, 6, 4)
+    conditional = torch.linspace(0.2, 1.0, 2 * 6 * 4).reshape(2, 6, 4).requires_grad_()
+    unconditional = torch.linspace(-0.4, 0.1, 2 * 6 * 4).reshape(2, 6, 4).requires_grad_()
+    timestep = scheduler.timesteps[1].expand(2)
+    calls = []
+
+    def module(hidden_states, text_token_ids):
+        assert hidden_states.shape == (2, 6, 4)
+        torch.testing.assert_close(hidden_states, latents[:, 0])
+        calls.append(text_token_ids)
+        return (conditional if text_token_ids is not None else unconditional,)
+
+    config = SimpleNamespace(
+        pipeline=SimpleNamespace(cfg_text_scale=cfg_scale, cfg_img_scale=1.0, cfg_renorm_type="global"),
+        algo=SimpleNamespace(noise_level=0.7, sde_type=sde_type),
+    )
+    inputs = {"hidden_states": latents[:, 0], "text_token_ids": torch.ones(2, 1, dtype=torch.long)}
+    negative = {**inputs, "text_token_ids": None}
+    actual = LanceDiffusion.forward_and_sample_previous_step(
+        module,
+        scheduler,
+        config,
+        inputs,
+        negative,
+        {
+            "all_latents": latents,
+            "all_timesteps": timestep[:, None],
+            "frame_condition_token_indexes": pinned,
+        },
+        0,
+    )
+    assert len(calls) == (2 if cfg_scale > 1 else 1)
+    velocity = conditional
+    if cfg_scale > 1:
+        guided = unconditional + cfg_scale * (conditional - unconditional)
+        scale = (conditional.norm(dim=(1, 2), keepdim=True) / (guided.norm(dim=(1, 2), keepdim=True) + 1e-8)).clamp(
+            min=LanceDiffusion._get_cfg_params(config)["cfg_renorm_min"], max=1.0
+        )
+        velocity = guided * scale
+        assert calls[1] is None
+    expected = []
+    for row in range(2):
+        fixed = pinned if pinned.ndim == 1 else pinned[row]
+        active = [index for index in range(6) if index not in fixed.tolist()]
+        expected.append(
+            scheduler.sample_previous_step(
+                sample=latents[row : row + 1, 0, active],
+                model_output=velocity[row : row + 1, active],
+                timestep=timestep[row : row + 1],
+                prev_sample=latents[row : row + 1, 1, active],
+                noise_level=0.7,
+                sde_type=sde_type,
+                return_sqrt_dt=True,
+                include_logprob_normalizer=False,
+            )
+        )
+    for index, result in enumerate(actual, start=1):
+        torch.testing.assert_close(result, torch.cat([row[index] for row in expected]))
+    assert actual[1].shape == (2, 4, 4)
+    actual_grad = torch.autograd.grad(
+        actual[0].sum(), (conditional, unconditional), allow_unused=True, retain_graph=True
+    )
+    expected_grad = torch.autograd.grad(
+        sum(row[1].sum() for row in expected), (conditional, unconditional), allow_unused=True
+    )
+    for actual_value, expected_value in zip(actual_grad, expected_grad, strict=True):
+        if expected_value is None:
+            assert actual_value is None
+        else:
+            torch.testing.assert_close(actual_value, expected_value)
+            assert actual_value.abs().sum() > 0
+    if cfg_scale == 1:
+        indexes = pinned.expand(2, -1) if pinned.ndim == 1 else pinned
+        assert torch.count_nonzero(actual_grad[0].gather(1, indexes[..., None].expand(-1, -1, 4))) == 0
+
+
+def test_i2v_replay_rejects_an_entirely_fixed_latent():
+    tensors = tuple(torch.randn(2, 6, 4) for _ in range(3))
+    with pytest.raises(ValueError, match="at least one unpinned"):
+        LanceDiffusion._select_scheduler_tokens(*tensors, {"frame_condition_token_indexes": torch.arange(6)})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("kind", ["image", "video"])
+async def test_lance_agent_preserves_raw_reference_for_pipeline(kind):
+    from verl_omni.pipelines.lance_flow_grpo.agent_loop import LanceDiffusionSingleTurnAgentLoop
+
+    agent = object.__new__(LanceDiffusionSingleTurnAgentLoop)
+    reference = object() if kind == "image" else "/data/reference.mp4"
+    messages = [{"role": "user", "content": [{"type": kind, kind: reference}, {"type": "text", "text": "edit"}]}]
+    assert await agent.process_multi_modal_info(messages) == {f"{kind}s": [reference]}
+
+
+@pytest.mark.asyncio
+async def test_lance_agent_rejects_unsupported_reference_combinations():
+    from verl_omni.pipelines.lance_flow_grpo.agent_loop import LanceDiffusionSingleTurnAgentLoop
+
+    agent = object.__new__(LanceDiffusionSingleTurnAgentLoop)
+    with pytest.raises(ValueError, match="one reference"):
+        await agent.ct_build_initial_tokens([], images=[object()], videos=[object()])
+    with pytest.raises(ValueError, match="without audio"):
+        await agent.ct_build_initial_tokens([], audios=[object()])
