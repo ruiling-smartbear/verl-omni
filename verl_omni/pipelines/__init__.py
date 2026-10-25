@@ -14,9 +14,13 @@
 
 from . import (
     bagel_flow_grpo,
+    boogu_image_diffusion_nft,
     boogu_image_flow_grpo,
     flux_dance_grpo,
+    lance_flow_grpo,
     ltx2_flow_grpo,
+    ltx2_omni_nft,
+    minicpm,
     minimax_h3_diffusion_nft,
     minimax_h3_flow_grpo,
     qwen3_omni,
@@ -27,14 +31,19 @@ from . import (
     qwen_image_edit_flow_grpo,
     qwen_image_flow_grpo,
     qwen_image_mix_grpo,
+    sd3_dgpo,
     sd3_dpo,
     sd3_flow_grpo,
     wan22_dance_grpo,
 )
 from .bagel_flow_grpo import *  # noqa: F401, F403
+from .boogu_image_diffusion_nft import *  # noqa: F401, F403
 from .boogu_image_flow_grpo import *  # noqa: F401, F403
 from .flux_dance_grpo import *  # noqa: F401, F403
+from .lance_flow_grpo import *  # noqa: F401, F403
 from .ltx2_flow_grpo import *  # noqa: F401, F403
+from .ltx2_omni_nft import *  # noqa: F401, F403
+from .minicpm import *  # noqa: F401, F403
 from .minimax_h3_diffusion_nft import *  # noqa: F401, F403
 from .minimax_h3_flow_grpo import *  # noqa: F401, F403
 from .qwen3_omni import *  # noqa: F401, F403
@@ -45,6 +54,7 @@ from .qwen_image_dual_grpo import *  # noqa: F401, F403
 from .qwen_image_edit_flow_grpo import *  # noqa: F401, F403
 from .qwen_image_flow_grpo import *  # noqa: F401, F403
 from .qwen_image_mix_grpo import *  # noqa: F401, F403
+from .sd3_dgpo import *  # noqa: F401, F403
 from .sd3_dpo import *  # noqa: F401, F403
 from .sd3_flow_grpo import *  # noqa: F401, F403
 from .wan22_dance_grpo import *  # noqa: F401, F403
@@ -55,9 +65,13 @@ __all__ += list(qwen_image_flow_grpo.__all__)
 __all__ += list(qwen_image_diffusion_nft.__all__)
 __all__ += list(qwen_image_mix_grpo.__all__)
 __all__ += list(bagel_flow_grpo.__all__)
+__all__ += list(lance_flow_grpo.__all__)
 __all__ += list(ltx2_flow_grpo.__all__)
+__all__ += list(ltx2_omni_nft.__all__)
+__all__ += list(minicpm.__all__)
 __all__ += list(minimax_h3_diffusion_nft.__all__)
 __all__ += list(minimax_h3_flow_grpo.__all__)
+__all__ += list(sd3_dgpo.__all__)
 __all__ += list(sd3_dpo.__all__)
 __all__ += list(sd3_flow_grpo.__all__)
 __all__ += list(wan22_dance_grpo.__all__)
@@ -65,4 +79,5 @@ __all__ += list(qwen_image_dpo.__all__)
 __all__ += list(qwen_image_dual_grpo.__all__)
 __all__ += list(qwen_image_edit_flow_grpo.__all__)
 __all__ += list(boogu_image_flow_grpo.__all__)
+__all__ += list(boogu_image_diffusion_nft.__all__)
 __all__ += list(flux_dance_grpo.__all__)

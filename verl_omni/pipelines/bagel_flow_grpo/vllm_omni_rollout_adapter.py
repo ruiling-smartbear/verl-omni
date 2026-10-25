@@ -27,6 +27,7 @@ import random
 from dataclasses import dataclass
 from typing import Any, Iterable, Optional
 
+import numpy as np
 import torch
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.models.bagel.pipeline_bagel import BagelPipeline
@@ -34,12 +35,14 @@ from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from verl_omni.pipelines.bagel_flow_grpo.common import (
     BAGEL_FLOWGRPO_CFG_DEFAULTS,
+    BAGEL_TIMESTEP_SHIFT,
     maybe_to_cpu,
     setup_bagel_sigmas,
 )
-from verl_omni.pipelines.diffusion_rollout_output import rollout_output
+from verl_omni.pipelines.diffusion_rollout_output import rollout_output, with_visual_artifacts
 from verl_omni.pipelines.model_base import VllmOmniPipelineBase
 from verl_omni.pipelines.rollout_media import DiffusionIOSpec, MediaSpec
+from verl_omni.pipelines.rollout_request import prompt_ids_from_payload
 from verl_omni.pipelines.schedulers import FlowMatchSDEDiscreteScheduler
 
 logger = logging.getLogger(__name__)
@@ -201,6 +204,37 @@ class _BagelSchedulerAdapter:
         return _AdapterStepOutput(prev_sample=prev_sample, log_prob=log_prob)
 
 
+def _slice_trajectory_to_window(
+    latents: Any,
+    timesteps: Any,
+    log_probs: Any,
+    sde_window: tuple[int, int],
+) -> tuple[Any, Any, Any]:
+    """Keep the ``[begin, end)`` steps of a time-major trajectory.
+
+    Latents keep one extra entry (the state after the last window step).
+    Log-probs need care: the scheduler adapter returns one only inside the
+    window and the pipeline drops the ``None`` entries, so the record is
+    normally already window-aligned and must not be sliced again; a record
+    covering the whole trajectory is sliced like the timesteps.
+    """
+    begin, end = sde_window
+    n_steps = len(timesteps) if timesteps is not None else None
+    if latents is not None:
+        latents = latents[begin : end + 1]
+    if timesteps is not None:
+        timesteps = timesteps[begin:end]
+    if log_probs is not None:
+        if n_steps is not None and len(log_probs) == n_steps:
+            log_probs = log_probs[begin:end]
+        elif len(log_probs) != end - begin:
+            raise ValueError(
+                f"expected {end - begin} in-window log-probs or {n_steps} for the whole "
+                f"trajectory, got {len(log_probs)}"
+            )
+    return latents, timesteps, log_probs
+
+
 def _pick_sde_window(
     window_size: Optional[int],
     window_range: Optional[Any],
@@ -243,9 +277,21 @@ def _pick_sde_window(
 class BagelPipelineWithLogProb(BagelPipeline):
     """BAGEL pipeline variant for RL rollouts with verl-omni."""
 
-    #: Declares the primary rollout media stream so downstream consumers read
-    #: the modality from the adapter instead of inferring it from tensor rank.
-    diffusion_io_spec = DiffusionIOSpec(primary=MediaSpec("image"))
+    #: Declares the named artifacts available to a request, so consumers select
+    #: one by name instead of inferring modality from tensor rank or channel size.
+    diffusion_io_spec = DiffusionIOSpec(
+        artifacts={
+            "image_preview": MediaSpec("image", "decoded", "CHW"),
+            "image_latent": MediaSpec("image", "latent", "LC"),
+        }
+    )
+
+    flowgrpo_timestep_shift: float = BAGEL_TIMESTEP_SHIFT
+
+    @classmethod
+    def flowgrpo_setup_sigmas(cls, scheduler: FlowMatchSDEDiscreteScheduler, num_steps: int, shift: float) -> None:
+        """Configure the model's denoising schedule before rollout."""
+        setup_bagel_sigmas(scheduler, num_steps, shift=shift)
 
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__(od_config=od_config, prefix=prefix)
@@ -292,7 +338,7 @@ class BagelPipelineWithLogProb(BagelPipeline):
 
         custom_prompt = req.prompts[0]
         if not custom_prompt.get("prompt"):
-            prompt = self._decode_token_prompt(custom_prompt.get("prompt_token_ids"))
+            prompt = self._decode_token_prompt(prompt_ids_from_payload(custom_prompt))
             if prompt is not None:
                 custom_prompt["prompt"] = prompt
 
@@ -302,11 +348,11 @@ class BagelPipelineWithLogProb(BagelPipeline):
             if negative_prompt is not None:
                 extra_args["negative_prompt"] = negative_prompt
 
-        prompt_extra_args = custom_prompt.get("extra_args")
-        if isinstance(prompt_extra_args, dict):
-            multi_modal_data = prompt_extra_args.get("multi_modal_data")
-            if multi_modal_data is not None and "multi_modal_data" not in custom_prompt:
-                custom_prompt["multi_modal_data"] = multi_modal_data
+    def _decode_image_from_latent(self, bagel, vae, latent, image_shape):
+        # Upstream decodes the final sample before optional trajectory previews.
+        if self._final_image_latent is None:
+            self._final_image_latent = latent
+        return super()._decode_image_from_latent(bagel, vae, latent, image_shape)
 
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
         self._ensure_bagel_prompt_text(req)
@@ -346,9 +392,12 @@ class BagelPipelineWithLogProb(BagelPipeline):
         self.scheduler_kwargs["include_logprob_normalizer"] = False
 
         # Per-request scheduler setup matching training-side sigma schedule.
+        # Pin the pipeline's own shift to the same value so the sigmas the
+        # scheduler holds and the ones the pipeline steps through cannot drift.
         assert req.sampling_params.num_inference_steps is not None, "num_inference_steps must be set for RL rollouts"
         bagel_num_timesteps = int(req.sampling_params.num_inference_steps)
-        setup_bagel_sigmas(self.scheduler._inner, bagel_num_timesteps)
+        timestep_shift = float(extra_args.setdefault("timestep_shift", self.flowgrpo_timestep_shift))
+        self.flowgrpo_setup_sigmas(self.scheduler._inner, bagel_num_timesteps, timestep_shift)
 
         # Reset adapter state *after* set_timesteps so inner step_index is None.
         self.scheduler.begin_forward(
@@ -358,19 +407,22 @@ class BagelPipelineWithLogProb(BagelPipeline):
         )
 
         # vllm-omni >= 0.24 (#4509) matches official BAGEL: n schedule points, n-1 denoise steps.
+        self._final_image_latent = None
         output = super().forward(req)
+        native_latent = self._final_image_latent
+        self._final_image_latent = None
+        if native_latent is None:
+            raise RuntimeError(
+                f"pipeline={type(self).__name__}, request_id={req.request_id}: no final native image latent"
+            )
 
         # Slice trajectory to the SDE window so training only sees noisy steps.
         traj_latents, traj_timesteps, traj_log_probs = _extract_bagel_trajectory(output)
 
         if sde_window is not None:
-            begin, end = sde_window
-            if traj_latents is not None:
-                traj_latents = traj_latents[begin : end + 1]
-            if traj_timesteps is not None:
-                traj_timesteps = traj_timesteps[begin:end]
-            if traj_log_probs is not None:
-                traj_log_probs = traj_log_probs[begin:end]
+            traj_latents, traj_timesteps, traj_log_probs = _slice_trajectory_to_window(
+                traj_latents, traj_timesteps, traj_log_probs, sde_window
+            )
 
         # BAGEL trajectories are time-major; add a batch axis for training consumers.
         if traj_latents is not None:
@@ -380,24 +432,28 @@ class BagelPipelineWithLogProb(BagelPipeline):
         if traj_log_probs is not None:
             traj_log_probs = traj_log_probs.unsqueeze(0)
 
-        media = output.output
-        media_key = "image"
-        metadata = None
-        if isinstance(media, dict) and isinstance(media.get("payload"), dict):
-            payload = dict(media["payload"])
-            metadata = dict(media.get("metadata") or {})
-            for key in ("image", "video", "output", "audio", "text"):
-                if key in payload:
-                    media = payload[key]
-                    media_key = key
-                    break
-
-        return rollout_output(
-            media=maybe_to_cpu(media),
-            media_key=media_key,
+        payload = output.output["payload"]
+        context = f"pipeline={type(self).__name__}, request_id={req.request_id}"
+        if "image" not in payload or payload.keys() - {"image", "trajectory"}:
+            raise ValueError(f"{context}: expected image and optional trajectory, got {list(payload)}")
+        media = torch.from_numpy(np.array(payload["image"], copy=True)).permute(2, 0, 1).unsqueeze(0)
+        metadata = dict(output.output.get("metadata") or {})
+        result = rollout_output(
+            media=media,
+            trajectory_decoded=payload.get("trajectory", {}).get("decoded"),
             trajectory_latents=maybe_to_cpu(traj_latents),
             trajectory_timesteps=maybe_to_cpu(traj_timesteps),
             trajectory_log_probs=maybe_to_cpu(traj_log_probs),
             metadata=metadata,
             to_cpu=False,
+        )
+        return with_visual_artifacts(
+            result,
+            decoded=media,
+            pixel_range="uint8",
+            latents=maybe_to_cpu(native_latent).unsqueeze(0),
+            latent_layout="LC",
+            output_type=req.sampling_params.output_type or "pil",
+            context=context,
+            requested=(req.sampling_params.extra_args or {}).get("requested_outputs"),
         )
