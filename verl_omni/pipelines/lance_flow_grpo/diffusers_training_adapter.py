@@ -54,7 +54,11 @@ class LanceDiffusion(BagelDiffusion):
             The loaded ``LanceForTraining`` module.
         """
         logger.info("Loading LanceForTraining from %s", model_config.local_path)
-        return LanceForTraining.from_pretrained(model_config.local_path, torch_dtype=torch_dtype)
+        return LanceForTraining.from_pretrained(
+            model_config.local_path,
+            torch_dtype=torch_dtype,
+            trust_remote_code=model_config.trust_remote_code,
+        )
 
     @classmethod
     def set_timesteps(
