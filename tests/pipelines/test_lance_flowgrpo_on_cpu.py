@@ -342,17 +342,75 @@ def test_config_reads_llm_dimensions_from_the_checkpoint(tmp_path):
     assert config.vae_downsample == 16
 
 
-def test_config_takes_boundary_tokens_from_the_llm_config(tmp_path):
+def test_config_takes_boundary_tokens_from_the_llm_config(tmp_path, monkeypatch):
     """The released config carries the vision token IDs; prefer them.
 
     Reading them here avoids loading the tokenizer, and keeps the trainer's
     boundary tokens identical to the ones the rollout embeds.
     """
+    from unittest.mock import Mock
+
+    from transformers import AutoTokenizer
+
+    load_tokenizer = Mock()
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", load_tokenizer)
     ckpt_dir = _write_tiny_checkpoint(str(tmp_path))
     config = LanceTrainingConfig.from_model_path(ckpt_dir)
 
     assert config.start_of_image_id == TINY_LLM_CONFIG["vision_start_token_id"]
     assert config.end_of_image_id == TINY_LLM_CONFIG["vision_end_token_id"]
+    load_tokenizer.assert_not_called()
+
+
+@pytest.mark.parametrize("trust_remote_code", [False, True])
+@pytest.mark.parametrize("missing_id", ["vision_start_token_id", "vision_end_token_id"])
+def test_build_module_preserves_tokenizer_trust_policy(tmp_path, monkeypatch, trust_remote_code, missing_id):
+    """Either missing boundary token must use the caller's tokenizer trust policy."""
+    from unittest.mock import Mock
+
+    from transformers import AutoTokenizer
+
+    from verl_omni.pipelines.lance_flow_grpo.diffusers_training_adapter import LanceDiffusion
+    from verl_omni.workers.config import DiffusionModelConfig
+
+    ckpt_dir = _write_tiny_checkpoint(str(tmp_path))
+    config = dict(TINY_LLM_CONFIG)
+    config.pop(missing_id)
+    with open(os.path.join(ckpt_dir, "llm_config.json"), "w") as f:
+        json.dump(config, f)
+    tokenizer = Mock(unk_token_id=0)
+    tokenizer.convert_tokens_to_ids.side_effect = [198, 199]
+    load_tokenizer = Mock(return_value=tokenizer)
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", load_tokenizer)
+    model_config = object.__new__(DiffusionModelConfig)
+    object.__setattr__(model_config, "local_path", str(tmp_path))
+    object.__setattr__(model_config, "trust_remote_code", trust_remote_code)
+
+    model = LanceDiffusion.build_module(model_config, torch.float32)
+
+    load_tokenizer.assert_called_once_with(ckpt_dir, trust_remote_code=trust_remote_code)
+    assert (model.config.start_of_image_id, model.config.end_of_image_id) == (198, 199)
+
+
+def test_from_pretrained_disables_remote_tokenizer_code_by_default(tmp_path, monkeypatch):
+    """Direct checkpoint loading must not implicitly trust custom tokenizer code."""
+    from unittest.mock import Mock
+
+    from transformers import AutoTokenizer
+
+    ckpt_dir = _write_tiny_checkpoint(str(tmp_path))
+    config = dict(TINY_LLM_CONFIG)
+    config.pop("vision_start_token_id")
+    with open(os.path.join(ckpt_dir, "llm_config.json"), "w") as f:
+        json.dump(config, f)
+    tokenizer = Mock(unk_token_id=0)
+    tokenizer.convert_tokens_to_ids.side_effect = [198, 199]
+    load_tokenizer = Mock(return_value=tokenizer)
+    monkeypatch.setattr(AutoTokenizer, "from_pretrained", load_tokenizer)
+
+    LanceForTraining.from_pretrained(str(tmp_path), torch_dtype=torch.float32)
+
+    load_tokenizer.assert_called_once_with(ckpt_dir, trust_remote_code=False)
 
 
 def test_checkpoint_mapping_keeps_the_transformer_and_drops_the_rest():
