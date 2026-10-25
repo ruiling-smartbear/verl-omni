@@ -1,4 +1,4 @@
-# Lance FlowGRPO training (text-to-image)
+# Lance FlowGRPO training
 
 Last updated: 10/24/2026.
 
@@ -8,8 +8,8 @@ editing in one autoregressive + diffusion model.  It is BAGEL-lineage:
 The integration reuses BAGEL's MoT training module and adapts Lance's
 checkpoint layout, latent geometry, sigma schedule and rotary positions.
 
-This milestone covers **`t2i` RL with LoRA on the generation expert**.  The
-video path (`t2v`, `i2v`, editing) is tracked separately; see
+M1 covers text-to-image LoRA training on the generation expert. M2 adds
+text-to-video. Conditioning is a separate draft milestone of
 [RFC #222](https://github.com/verl-project/verl-omni/issues/222).
 
 ## What differs from BAGEL
@@ -146,10 +146,18 @@ at 15 steps) puts every timestep into the comparison.
 
 ## Not covered here
 
-- `t2v` / `i2v` / image and video editing: these need the 3-D latent position
-  embedding and the temporal mRoPE axis, plus the Wan2.2 multi-frame decode in
-  the reward path.  The 2-D positions this adds are the image case of the same
-  construction, so the video case extends `build_position_ids` rather than
-  replacing it.
 - `x2t_image` / `x2t_video`: autoregressive token generation, so they belong to
   the AR/VLM RL path rather than the diffusion FlowGRPO adapter.
+
+## Text-to-video (M2)
+
+Select `Lance_3B_Video` explicitly, then run
+`run_lance_t2v_imagebind_lora.sh` or `run_lance_t2v_imagebind_smoke.sh`.
+This adds temporal position embeddings and three-axis video RoPE. All decoded
+frames and the native flattened latents use the current named-artifact contract.
+Video trajectory recording requires [vllm-omni#7907](https://github.com/vllm-project/vllm-omni/pull/7907).
+The upstream dependency pin is unchanged. This stage remains a draft until that
+dependency and current-version GPU replay validation are available.
+
+Long training, convergence and throughput benchmarks require maintainer resources;
+the smoke recipe covers two updates and does not establish convergence.
