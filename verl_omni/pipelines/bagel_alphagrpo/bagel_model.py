@@ -22,6 +22,8 @@ from torch import nn
 
 from verl_omni.pipelines.bagel_flow_grpo.bagel_model import BagelForTraining
 
+from .reflection_context import context_layout
+
 
 class BagelForAlphaGRPO(BagelForTraining):
     """Joint understanding and generation policy; see the BAGEL README Gotchas."""
@@ -46,9 +48,22 @@ class BagelForAlphaGRPO(BagelForTraining):
         thinking_labels=None,
         thinking_mask=None,
         thinking_temperature=1.0,
+        condition_image_embeds=None,
+        condition_image_layout=None,
         **kwargs,
     ):
         """Replay masked text log-probs [B, L], or delegate the image velocity forward."""
+        if condition_image_embeds is not None:
+            return self._forward_reflection(
+                condition_image_embeds,
+                condition_image_layout,
+                thinking_input_ids,
+                thinking_attention_mask,
+                thinking_labels,
+                thinking_mask,
+                thinking_temperature,
+                **kwargs,
+            )
         if thinking_input_ids is None:
             return super().forward(**kwargs)
         sequence = self.embed_tokens(thinking_input_ids)
@@ -65,3 +80,55 @@ class BagelForAlphaGRPO(BagelForTraining):
         labels = thinking_labels[thinking_mask]
         log_probs = logits.gather(-1, labels.unsqueeze(-1)).squeeze(-1) - logits.logsumexp(-1)
         return log_probs.new_zeros(thinking_input_ids.shape).masked_scatter(thinking_mask, log_probs)
+
+    def _forward_reflection(
+        self, image_embeds, image_layout, thinking_ids, thinking_valid, labels, action_mask, temperature, **kwargs
+    ):
+        """Replay frozen visual inputs through trainable MoT layers, including both image blocks."""
+        if any(
+            p.requires_grad
+            for module in (self.embed_tokens, self.vae2llm, self.time_embedder, self.latent_pos_embed)
+            for p in module.parameters()
+        ):
+            raise ValueError(
+                "Image replay requires frozen token embeddings, VAE projection, time and position embeddings."
+            )
+        token_ids = thinking_ids if thinking_ids is not None else kwargs["text_token_ids"]
+        valid = thinking_valid if thinking_ids is not None else kwargs["text_attention_mask"]
+        outputs = []
+        for row in range(token_ids.shape[0]):
+            length = int(valid[row].sum())
+            start, vae_length, vit_length = image_layout[row].tolist()
+            sequence = self.embed_tokens(token_ids[row : row + 1, :length])
+            image_length = vae_length + vit_length
+            if image_length:
+                sequence = sequence.clone()
+                sequence[:, start : start + image_length] = image_embeds[row, :image_length].to(sequence.dtype)
+            target_length = 0
+            if thinking_ids is None:
+                latents = kwargs["hidden_states"][row : row + 1]
+                target = self.vae2llm(latents) + self.time_embedder(kwargs["timestep"][row : row + 1])[:, None]
+                target = target + self.latent_pos_embed(kwargs["latent_pos_ids"][row : row + 1])
+                boundaries = self.embed_tokens(
+                    token_ids.new_tensor([[self.config.start_of_image_id, self.config.end_of_image_id]])
+                )
+                sequence = torch.cat((sequence, boundaries[:, :1], target.to(sequence.dtype), boundaries[:, 1:]), dim=1)
+                target_length = latents.shape[1] + 2
+            positions, generation, visible = context_layout(
+                length, start, vae_length, vit_length, sequence.device, target_length
+            )
+            for layer in self.layers:
+                sequence = self._checkpointed_call(
+                    layer, sequence, positions[None], ~generation[None], generation[None], 0, None, visible[None, None]
+                )
+            if thinking_ids is not None:
+                mask = action_mask[row, :length]
+                logits = self.lm_head(self.norm(sequence[0, mask])).float() / temperature
+                log_probs = logits.gather(-1, labels[row, :length][mask, None]).squeeze(-1) - logits.logsumexp(-1)
+                output = log_probs.new_zeros(token_ids.shape[1])
+                output[:length] = output[:length].masked_scatter(mask, log_probs)
+                outputs.append(output[None])
+            else:
+                outputs.append(self.llm2vae(self.norm_moe_gen(sequence[:, length + 1 : -1])))
+        result = torch.cat(outputs)
+        return result if thinking_ids is not None else (result,)

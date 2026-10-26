@@ -209,56 +209,5 @@ returned as metrics. HTTP failures propagate; they are not converted into zero r
 
 ## AlphaGRPO
 
-The experimental single-turn [AlphaGRPO](https://github.com/huangrh99/AlphaGRPO)
-GPU recipe trains BAGEL thinking and image generation together. It combines a clipped
-sequence-ratio text objective with image FlowGRPO, DVReward and the thinking-tag
-format reward. Multi-turn self-reflective refinement and image editing are not
-supported by this adapter.
-
-Native BAGEL smoke runs verified FSDP2 joint LoRA updates and merged weight sync.
-Four short runs with four H100 GPUs and the official 30B judge completed at 512px
-(two training seeds, eight updates per run). A 16-prompt heldout PickScore comparison
-did not establish a stable quality improvement. Inference speed was not measured.
-
-### Training
-
-Use the DVReward data above, then run:
-
-```bash
-DATA_DIR=/path/to/dvreward \
-  bash examples/flowgrpo_trainer/bagel/run_bagel_alphagrpo_lora.sh \
-  actor_rollout_ref.model.path=/path/to/BAGEL-7B-MoT \
-  actor_rollout_ref.model.tokenizer_path=/path/to/BAGEL-7B-MoT
-```
-
-The wrapper trains both understanding and generation LoRA projections with FSDP2.
-
-### Gotchas
-
-- AlphaGRPO uses the reference planning system prompt. Its three image contexts
-  are system + prompt + thinking, system only, and system + prompt. Replay uses
-  exact native token IDs; decoding is used only for reward scoring and logging.
-- Thinking requires `think_top_p=1`: sampling and replay use the same
-  temperature-scaled distribution. This differs from the reference's truncated
-  sampling with full-vocabulary likelihoods. Sequence ratios stay paired with
-  each sample's own advantage.
-- Rollout correction is unsupported for this joint objective and is rejected.
-  Image-step correction weights cannot be reused as text importance weights.
-- Only sampled thinking actions enter the text loss. A forced end token after
-  reaching the thinking budget conditions the image but is excluded from the
-  text loss. The text objective runs once per micro-batch, with image-step-count
-  compensation before the shared gradient-accumulation division.
-- The single-turn reward adds `1` when thinking starts with `<think>` and ends
-  with `</think>`, matching the reference T2I task. `dvreward`, component scores
-  and `thinking_format_score` are logged separately.
-- Rollout currently requires TP=CFG=SP=1 and full-request execution. Actor
-  sequence parallelism and timestep staging are unsupported. Merged LoRA sync
-  routes the language head separately from the transformer body.
-- `pipeline.max_sequence_length` must hold the system prompt, native prompt and
-  `max_think_tokens + 2` framing budget. The default thinking budget is 128;
-  this recipe uses 512 with a total length of 2048. Overflow is rejected. Negative prompts
-  are unsupported because text CFG uses the planning system context.
-- Image-only DVReward uses the original FlowGRPO adapter; enabling its upstream
-  `think=true` path would not provide joint text training or matching replay. Use
-  `model.algorithm=alphagrpo` and the AlphaGRPO recipe for thinking. This is an
-  integration, not evidence of a stable quality or speed improvement.
+For joint thinking and image training, see the
+[BAGEL AlphaGRPO recipe](../../alphagrpo_trainer/README.md).

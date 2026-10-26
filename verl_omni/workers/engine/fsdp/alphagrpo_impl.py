@@ -43,6 +43,11 @@ class AlphaGRPOFSDPEngine(PPODiffusersFSDPEngine):
                 thinking_attention_mask=micro_batch["thinking_attention_mask"],
                 thinking_labels=micro_batch["thinking_labels"],
                 thinking_mask=micro_batch["thinking_mask"],
+                **{
+                    key: micro_batch[key]
+                    for key in ("condition_image_embeds", "condition_image_layout")
+                    if key in micro_batch
+                },
                 thinking_temperature=self.model_config.pipeline.think_temperature,
             )
             model_output["text_log_probs"] = text_log_probs

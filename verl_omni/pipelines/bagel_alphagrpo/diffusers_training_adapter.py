@@ -20,6 +20,7 @@ from verl_omni.pipelines.bagel_flow_grpo.diffusers_training_adapter import Bagel
 from verl_omni.pipelines.model_base import DiffusionModelBase
 
 from .bagel_model import BagelForAlphaGRPO
+from .reflection import REFLECTION_CFG
 
 
 @DiffusionModelBase.register("OmniBagelForConditionalGeneration", algorithm="alphagrpo")
@@ -76,6 +77,10 @@ class BagelAlphaGRPO(BagelDiffusion):
             "text_token_ids": batch["cfg_image_ids"],
             "text_attention_mask": batch["cfg_image_mask"],
         }
+        if "condition_image_embeds" in batch:
+            for branch in (inputs, negative):
+                branch["condition_image_embeds"] = batch["condition_image_embeds"]
+                branch["condition_image_layout"] = batch["condition_image_layout"]
         return inputs, negative
 
     @staticmethod
@@ -97,6 +102,9 @@ class BagelAlphaGRPO(BagelDiffusion):
         """Recompute image likelihoods with the rollout's system, prompt and thinking contexts."""
         noise_pred = cls._forward_rows(module, model_inputs)
         cfg = cls._get_cfg_params(model_config)
+        if "condition_image_embeds" in model_inputs:
+            cfg.update({key: value for key, value in REFLECTION_CFG.items() if key != "cfg_interval"})
+            cfg["cfg_interval_low"], cfg["cfg_interval_high"] = REFLECTION_CFG["cfg_interval"]
         sigmas = scheduler_inputs["all_timesteps"][:, step]
         cfg_mask = (sigmas > cfg["cfg_interval_low"]) & (sigmas <= cfg["cfg_interval_high"])
         if cfg["cfg_text_scale"] > 1:
