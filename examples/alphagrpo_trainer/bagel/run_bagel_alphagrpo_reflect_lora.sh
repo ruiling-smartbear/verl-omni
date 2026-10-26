@@ -14,7 +14,7 @@ bash "$recipe_dir/run_bagel_alphagrpo_lora.sh" \
     "+actor_rollout_ref.rollout.agent.agent_loop_config_path=$recipe_dir/reflection_agent.yaml" \
     actor_rollout_ref.rollout.agent.default_agent_loop=bagel_reflection_agent \
     actor_rollout_ref.rollout.n=14 \
-    actor_rollout_ref.rollout.pipeline.max_sequence_length=4096 \
+    actor_rollout_ref.rollout.pipeline.max_sequence_length=8192 \
     actor_rollout_ref.rollout.pipeline.num_inference_steps=40 \
     actor_rollout_ref.rollout.val_kwargs.pipeline.num_inference_steps=40 \
     actor_rollout_ref.rollout.algo.sde_window_size=5 \
@@ -23,6 +23,7 @@ bash "$recipe_dir/run_bagel_alphagrpo_lora.sh" \
     actor_rollout_ref.actor.diffusion_loss.text_loss_weight=0.2 \
     reward.custom_reward_function.name=compute_score_dvreward \
     reward.reward_model.enable_resource_pool=True \
+    reward.reward_model.rollout.free_cache_engine=False \
     reward.reward_model.nnodes=1 \
     "reward.reward_model.n_gpus_per_node=$REWARD_GPUS" \
     "reward.reward_model.rollout.tensor_model_parallel_size=$REWARD_GPUS" \

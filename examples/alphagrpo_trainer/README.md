@@ -63,14 +63,19 @@ reproduction: it retains the existing full-distribution thinking sampler
 (`think_top_p=1`), the existing FlowGRPO sample-standard-deviation normalization,
 and the pinned vLLM-Omni image preprocessing. The reference uses top-p 0.8,
 population standard deviation, and its own image transforms. The text budget here
-is 512 and the total replay budget is 4096. Earlier single-turn GPU checks do not
+is 512 and the total replay budget is 8192. Earlier single-turn GPU checks do not
 validate this path.
+
+The native SigLIP processor resizes to 980×980, yielding 4900 visual patches
+before image boundaries. The replay budget must also include VAE tokens, the
+reflection prompt and thinking tokens, even for a small generated image.
 
 ## Refinement replay constraints
 
 - Use the synchronous V0 recipe (`trainer.use_v1=false`). The TQ/V1 scheduler does
   not implement this batch-level selection barrier.
-- Reward workers must be available during rollout, on their own resource pool.
+- Reward workers must remain resident during rollout on their own resource pool
+  (`reward.reward_model.rollout.free_cache_engine=false`).
   The colocated reward-after-rollout path cannot score the initial stage midway.
 - The rollout returns frozen VAE/ViT input embeddings, image-block lengths and
   native text IDs. Training replays both image blocks through the trainable MoT

@@ -216,7 +216,10 @@ class BagelAlphaGRPOPipeline(BagelPipelineWithLogProb):
                 )
                 prefix_ids = system_ids + [0] * sum(image_lengths) + prompt_ids
                 if len(prefix_ids) + max_tokens + 2 > width:
-                    raise ValueError("Image, prompt and thinking budget exceed pipeline.max_sequence_length.")
+                    raise ValueError(
+                        f"Image, prompt and thinking budget require {len(prefix_ids) + max_tokens + 2} tokens; "
+                        f"pipeline.max_sequence_length={width}."
+                    )
             prefix_rope = len(system_ids) + (2 if images else 0) + len(prompt_ids)
             prefix_cache = self._prefill(deepcopy(system_cache), prompt_ids, prefix_rope - len(prompt_ids))
             tokens, old_log_probs = self._sample_thinking(

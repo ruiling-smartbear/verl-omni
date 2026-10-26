@@ -117,3 +117,30 @@ def test_missing_uid_fails_before_generation():
 
     with pytest.raises(ValueError, match="UIDs"):
         asyncio.run(run())
+
+
+@pytest.mark.parametrize("free_cache_engine", [True, False])
+def test_manager_requires_resident_judge(monkeypatch, free_cache_engine):
+    from verl_omni.pipelines.bagel_alphagrpo import reflection_agent
+
+    config = SimpleNamespace(
+        trainer={"use_v1": False},
+        reward=SimpleNamespace(
+            reward_model=SimpleNamespace(rollout=SimpleNamespace(free_cache_engine=free_cache_engine)),
+            custom_reward_function=SimpleNamespace(name="compute_score_dvreward"),
+        ),
+    )
+
+    def initialize(self):
+        self.config = config
+        self.reward_loop_worker_handles = [object()]
+        self.model_config = SimpleNamespace(algorithm="alphagrpo")
+        self.rollout_config = SimpleNamespace(pipeline={}, n=2)
+
+    monkeypatch.setattr(AgentLoopManager, "__init__", initialize)
+    monkeypatch.setattr(reflection_agent.ray, "remote", lambda cls: cls, raising=False)
+    if free_cache_engine:
+        with pytest.raises(ValueError, match="resident judge"):
+            BagelReflectionAgentLoopManager()
+    else:
+        assert BagelReflectionAgentLoopManager().config is config

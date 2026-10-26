@@ -77,6 +77,10 @@ class BagelReflectionAgentLoopManager(AgentLoopManager):
             or self.rollout_config.pipeline.get("output_type", "image") != "image"
         ):
             raise ValueError("Reflection requires the AlphaGRPO adapter and decoded image output.")
+        if self.config.reward.reward_model.rollout.free_cache_engine:
+            raise ValueError(
+                "Reflection requires a resident judge: set reward.reward_model.rollout.free_cache_engine=false."
+            )
         if self.config.reward.custom_reward_function.name != "compute_score_dvreward":
             raise ValueError("Reflection requires raw DVReward; format bonuses must not affect image comparisons.")
         if self.rollout_config.n < 2:
