@@ -148,3 +148,61 @@ def test_absent_logprobs_falls_back_to_answer():
 def test_fallback_rejects_non_binary_answer():
     with pytest.raises(ValueError, match="yes or no"):
         _yes_probability({"choices": [{"logprobs": None, "message": {"content": "maybe"}}]})
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("cancel_parent", [False, True])
+async def test_pending_questions_finish_before_session_closes(monkeypatch, cancel_parent):
+    from contextlib import asynccontextmanager
+
+    from verl_omni.utils.reward_score import dvreward
+
+    started = asyncio.Event()
+    tasks = []
+    finished_before_close = []
+
+    class Session:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *args):
+            finished_before_close.extend(task.done() for task in tasks)
+
+        @asynccontextmanager
+        async def post(self, url, json):
+            tasks.append(asyncio.current_task())
+            question = json["messages"][1]["content"][1]["text"]
+            if question == "Is there a cat?" and not cancel_parent:
+                await started.wait()
+                raise ValueError("judge request failed")
+            started.set()
+            await asyncio.Event().wait()
+            yield
+
+    monkeypatch.setattr(dvreward.aiohttp, "ClientSession", lambda **kwargs: Session())
+    parent = asyncio.create_task(
+        compute_score_dvreward(
+            "test",
+            torch.zeros(3, 8, 8, dtype=torch.uint8),
+            "cat",
+            {**image_info(), "media_kind": "image"},
+            "unused",
+            "judge",
+        )
+    )
+    try:
+        if cancel_parent:
+            await asyncio.wait_for(started.wait(), 2)
+            parent.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await parent
+        else:
+            with pytest.raises(ValueError, match="judge request failed"):
+                await asyncio.wait_for(parent, 2)
+        assert len(tasks) == 2
+        assert finished_before_close == [True, True]
+        assert tasks[-1].cancelled()
+    finally:
+        for task in [parent, *tasks]:
+            task.cancel()
+        await asyncio.gather(parent, *tasks, return_exceptions=True)

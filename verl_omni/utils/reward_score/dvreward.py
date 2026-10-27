@@ -132,7 +132,13 @@ async def compute_score_dvreward(
                     response.raise_for_status()
                     return _yes_probability(await response.json())
 
-        scores = await asyncio.gather(*(score_question(question) for question in semantic + quality))
+        tasks = [asyncio.create_task(score_question(question)) for question in semantic + quality]
+        try:
+            scores = await asyncio.gather(*tasks)
+        finally:
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
     semantic_score = sum(scores[: len(semantic)]) / len(semantic)
     quality_score = sum(scores[len(semantic) :]) / len(quality)
     return {
